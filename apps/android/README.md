@@ -1,4 +1,4 @@
-# PurePrivacy — Android client (Phase 2)
+# Privacy Bolt — Android client (Phase 2)
 
 The branded native client: **matrix-rust-sdk** (Element X's exact engine, E2EE +
 native sliding sync) over **embedded Tor** (no Orbot), in a dark + sunflower
@@ -53,7 +53,7 @@ compileSdk 34, minSdk 26. ABIs: arm64-v8a (phones) + x86_64 (emulator).
 
 ## Run
 
-1. Stand up a [PurePrivacy desktop](../../../pureprivacy-desktop) box and note its
+1. Stand up a [Privacy Bolt desktop](../../../privacy-lodge) box and note its
    `.onion`.
 2. **Log in** — enter the onion (`:8008` is assumed if no port), your username and
    password. The app waits for embedded Tor, then connects.
@@ -84,7 +84,7 @@ content / Private Network Access, so the WebView only ever talks to `127.0.0.1`:
 
 The box side must serve these endpoints over **TLS on the onion** (Caddy: lk-jwt
 `:8443`, client API `:8009`, wss SFU `:7443`) and map onion `:80`→tuwunel — see
-[`pureprivacy-desktop`](../../../pureprivacy-desktop). The full requirements +
+[`privacy-lodge`](../../../privacy-lodge). The full requirements +
 findings are in [`../../docs/element-call-over-onion-requirements.md`](../../docs/element-call-over-onion-requirements.md).
 
 ## Not yet wired

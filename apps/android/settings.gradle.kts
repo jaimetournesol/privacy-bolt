@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "PurePrivacy"
+rootProject.name = "PrivacyBolt"
 include(":app")
