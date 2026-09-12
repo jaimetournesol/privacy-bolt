@@ -1,4 +1,4 @@
-# PurePrivacy iOS (SwiftUI)
+# Privacy Bolt iOS (SwiftUI)
 
 The iOS shell — **not started yet** (stub). The working client today is
 [`../android`](../android), which builds on the prebuilt `matrix-rust-sdk`

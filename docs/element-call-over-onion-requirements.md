@@ -3,9 +3,9 @@
 **Why this doc exists:** a 2-emulator test (2026-06-13) proved every layer of
 cross-install voice over Tor *except* the Element Call WebView on **stock Element
 X**, which is blocked by its own web-security policy — not by Tor or the media
-path. Full findings: `pureprivacy-private/docs/redesign/2026-06-emulator-voice-test.md`.
+path. Full findings: `privacy-bolt-private/docs/redesign/2026-06-emulator-voice-test.md`.
 The media plane itself is **proven** to traverse Tor (TURN-relay-at-onion, 0%
-loss: `pureprivacy-private/docs/redesign/2026-06-media-over-tor.md`). So the
+loss: `privacy-bolt-private/docs/redesign/2026-06-media-over-tor.md`). So the
 branded client's job is to remove the **client-side** barriers below.
 
 ## What's already proven (don't re-litigate)

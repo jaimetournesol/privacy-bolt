@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PurePrivacy — live appliance-box dashboard (for the demo screen-recording).
+# Privacy Bolt — live appliance-box dashboard (for the demo screen-recording).
 # Headless Docker "boxes" rendered as a visual TUI. Ctrl-C to quit.
 Y='\033[38;5;220m'; G='\033[38;5;46m'; R='\033[38;5;203m'; D='\033[38;5;245m'; W='\033[97m'; B='\033[1m'; X='\033[0m'
 CY='\033[38;5;208m'

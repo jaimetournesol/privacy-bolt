@@ -55,7 +55,7 @@ for tracking.
 
 ## Free-text clarification (paste where allowed)
 
-> PurePrivacy is a self-hosted, Tor-only, end-to-end-encrypted messenger and personal backup
+> Privacy Bolt is a self-hosted, Tor-only, end-to-end-encrypted messenger and personal backup
 > app. All user data — messages, calls, and any photos, videos or files the user chooses to
 > back up — is end-to-end encrypted and transmitted only over the Tor network to a server
 > ("box") that the user themselves runs and controls. The developer operates no servers and

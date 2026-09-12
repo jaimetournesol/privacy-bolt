@@ -1,10 +1,10 @@
-PurePrivacy — your own private box
+Privacy Bolt — your own private box
 Copyright (C) 2026 Tournesol (jaime.melon@tournesol.ai)
 
 Licensed under the GNU Affero General Public License, version 3 or (at your option)
 any later version. The full text follows.
 
-Why AGPL: PurePrivacy asks you to trust software with your private messages. The AGPL
+Why AGPL: Privacy Bolt asks you to trust software with your private messages. The AGPL
 guarantees that anyone running or offering this software must be able to obtain its
 source — including over a network — so that trust can always be checked rather than
 taken on faith. It is also the licence of components we build on (Element Call,

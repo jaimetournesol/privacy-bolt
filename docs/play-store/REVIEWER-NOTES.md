@@ -1,7 +1,7 @@
 # Play Console — App access (instructions for Google reviewers)
 
 The app is **login-gated**: on first launch it shows a sign-in screen and does nothing until
-it connects to a **box** (a PurePrivacy server) over Tor. A reviewer with only the app cannot
+it connects to a **box** (a Privacy Bolt server) over Tor. A reviewer with only the app cannot
 proceed — **this is the single most common reason an app like this gets rejected.** So we must
 give reviewers a working box to sign into, in Play Console → **App content → App access**
 ("All or some functionality is restricted" → add instructions).
@@ -13,7 +13,7 @@ up for updates). Run it however is easiest — the published Docker image is sim
 
 ```bash
 docker run -d --name pp-demo --restart unless-stopped -v pp-demo-data:/data \
-  -p 127.0.0.1:8470:8470 -e PUREPRIVACY_SETUP_BIND=0.0.0.0 jaimemelon/pureprivacy-box:latest
+  -p 127.0.0.1:8470:8470 -e PUREPRIVACY_SETUP_BIND=0.0.0.0 jaimemelon/privacy-lodge-box:latest
 # open http://127.0.0.1:8470/ → create username `demo` + a password → note the onion it shows
 ```
 
@@ -23,7 +23,7 @@ onion + credentials and paste them into the fields below.
 ## Instructions to paste into "App access"
 
 ```
-This app connects only to a self-hosted PurePrivacy "box" over the Tor network — it has no
+This app connects only to a self-hosted Privacy Bolt "box" over the Tor network — it has no
 central server, so a test box is provided below. There is no cost and no personal data.
 
 To sign in:
