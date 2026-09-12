@@ -4,7 +4,7 @@
 The wizard used to carry six hand-written providers while Hermes ships ~40. Rather than
 maintain a second list by hand and let it drift, generate it from the source of truth:
 
-    docker exec pureprivacy-agent /opt/hermes/venv/bin/python \\
+    docker exec privacy-lodge-agent /opt/hermes/venv/bin/python \\
       /dev/stdin < tools/gen-agent-providers.py > /tmp/providers.kt
 
 Then paste the block between the AGENT_PROVIDERS markers in MainActivity.kt. Re-run it

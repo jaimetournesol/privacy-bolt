@@ -1,8 +1,8 @@
-# PurePrivacy — Privacy Policy
+# Privacy Bolt — Privacy Policy
 
 **Last updated: 23 July 2026**
 
-PurePrivacy is a private, end-to-end-encrypted messenger and companion app for your own
+Privacy Bolt is a private, end-to-end-encrypted messenger and companion app for your own
 **box** — a personal server you (or someone you trust) run on your own computer. This policy
 explains exactly what the app does with your data. The short version: **we, Tournesol, run no
 servers and collect nothing about you.** Your data lives on *your* box and your device.
@@ -89,7 +89,7 @@ have questions, contact **privacy@tournesol.ai**.
 
 ## Children
 
-PurePrivacy is not directed to children under 13 (or the equivalent minimum age in your
+Privacy Bolt is not directed to children under 13 (or the equivalent minimum age in your
 jurisdiction), and we do not knowingly collect data from them (we collect no data at all).
 
 ## Changes to this policy

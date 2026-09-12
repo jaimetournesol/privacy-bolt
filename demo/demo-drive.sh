@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PurePrivacy auto-demo driver. Drives both emulators through the full flow so it
+# Privacy Bolt auto-demo driver. Drives both emulators through the full flow so it
 # can be screen-recorded hands-free. Usage: demo-drive.sh <phase>
 #   phases: reset login connect chat call hangup all
 set -uo pipefail
@@ -7,7 +7,7 @@ export ANDROID_HOME=$HOME/Android/Sdk
 export PATH=$PATH:$ANDROID_HOME/platform-tools
 A=emulator-5554   # ALICE
 B=emulator-5556   # BOB
-PKG=ai.tournesol.pureprivacy
+PKG=ai.tournesol.privacybolt
 ONION1=n7jzgndncojguozwp36arrdkeruf7jsgw6h6echfzwrksdfognexutyd.onion
 ONION2=ttdu4rsuqadza7ezl4mh4kotsyyveqv2jmzm7wj6ffg45fzpmrpwdgyd.onion
 ALICE_ID="@alice:${ONION1}"
@@ -105,7 +105,7 @@ case "${1:-all}" in
   chat)
     say "BOB → says hi"
     c=$(findc "$B" 'text="Message"') || c="465 2237"; adb -s "$B" shell input tap $c
-    adb -s "$B" shell input text "Hi%sAlice%s-%sPurePrivacy%sover%sTor"
+    adb -s "$B" shell input text "Hi%sAlice%s-%sPrivacy Bolt%sover%sTor"
     tapm "$B" 'content-desc="send"' || adb -s "$B" shell input tap 991 1444
     hide_ime "$B"
     say "ALICE → opens the chat and replies"

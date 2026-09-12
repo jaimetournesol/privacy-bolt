@@ -1,13 +1,13 @@
 [package]
-name = "pureprivacy_core"
+name = "privacy_bolt_core"
 version = "0.1.0"
 edition = "2021"
-description = "PurePrivacy mobile shared core — Matrix client over embedded Tor (arti), exposed to SwiftUI + Compose via UniFFI"
+description = "Privacy Bolt shared core — Matrix client over embedded Tor (arti), exposed to SwiftUI + Compose via UniFFI"
 
 [lib]
 # `cdylib`/`staticlib` for the iOS/Android FFI; `lib` so we can unit-test.
 crate-type = ["cdylib", "staticlib", "lib"]
-name = "pureprivacy_core"
+name = "privacy_bolt_core"
 
 [dependencies]
 uniffi = { version = "0.28", features = ["tokio"] }

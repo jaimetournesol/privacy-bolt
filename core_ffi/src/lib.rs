@@ -1,4 +1,4 @@
-//! PurePrivacy mobile shared core.
+//! Privacy Bolt shared core.
 //!
 //! One thin Rust crate, exposed to **SwiftUI (iOS)** and **Compose (Android)**
 //! via UniFFI, so both platforms share exactly one networking/crypto core and

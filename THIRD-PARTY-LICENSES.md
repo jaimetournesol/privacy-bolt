@@ -1,6 +1,6 @@
-# Third-party software in PurePrivacy
+# Third-party software in Privacy Bolt
 
-A PurePrivacy box is the PurePrivacy application **plus** several independent programs that it
+A Privacy Lodge box is the Privacy Bolt application **plus** several independent programs that it
 bundles and runs. Those programs are the property of their authors and are used under their own
 licences, reproduced or linked below. Nothing here is claimed as Tournesol's work.
 
@@ -43,10 +43,10 @@ directly, or have trouble obtaining it upstream, write to **jaime.melon@tourneso
 will provide it at no charge, by a means of your choosing, for as long as we distribute the
 binary.
 
-Nothing in PurePrivacy's own licence restricts your rights under the AGPL for these components.
+Nothing in Privacy Bolt's own licence restricts your rights under the AGPL for these components.
 
 ## Why this matters here
 
-PurePrivacy asks you to trust software that handles your private messages. That trust depends
+Privacy Bolt asks you to trust software that handles your private messages. That trust depends
 on the software being inspectable — which is precisely what these licences guarantee. Honouring
 them is the same commitment we make to you, kept toward the people whose work we build on.

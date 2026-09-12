@@ -61,6 +61,6 @@ jobs:
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: pureprivacy-debug-apk
+          name: privacy-bolt-debug-apk
           path: apps/android/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 14

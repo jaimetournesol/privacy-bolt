@@ -1,13 +1,13 @@
-# PurePrivacy Mobile — the portal to your box
+# Privacy Bolt Mobile — the portal to your box
 
 > **Take your data back.** The phone is your portal into your own private server —
 > your *box* — that hosts your apps over Tor, end-to-end encrypted, with no
 > corporation in the middle.
 
 Your messages, your friends, your calls — right now they live on corporate servers,
-harvested for profit and surveillance. **PurePrivacy is how you take them back.**
+harvested for profit and surveillance. **Privacy Bolt is how you take them back.**
 This app talks **only to your own `.onion` box** (the
-[PurePrivacy desktop](../pureprivacy-desktop) appliance): every request — login,
+[Privacy Bolt desktop](../privacy-lodge) appliance): every request — login,
 messages, calls — runs through an **embedded Tor inside the app**, built on Element
 X's exact engine (`matrix-rust-sdk`, E2EE + native sliding sync). No central server,
 no Google/FCM push, no Orbot, no VPN, no third party in the path.
@@ -31,7 +31,7 @@ your apps. The phone is how you reach them:
 > **Status: Phase-2 client, in development.** The Android client is real and working
 > (login, contacts, chat, and voice/video calls all run over Tor — see below). iOS
 > is a stub. Architecture/decisions live in the appliance repo:
-> `pureprivacy-private/docs/redesign/`.
+> `privacy-bolt-private/docs/redesign/`.
 
 ## What it is
 
@@ -40,7 +40,7 @@ your apps. The phone is how you reach them:
   routed through an **embedded Tor** the app runs itself (`socks5h://` +
   HTTP-tunnel on loopback). There is no clearnet account traffic and no third
   party in the path.
-- **No push gateway.** PurePrivacy can't use FCM/APNs-style push without leaking to
+- **No push gateway.** Privacy Bolt can't use FCM/APNs-style push without leaking to
   clearnet, so a **foreground service** keeps the matrix-rust-sdk sync (and Tor)
   alive in the background and posts local notifications for messages, calls, and
   invites.
@@ -105,7 +105,7 @@ echo "sdk.dir=$HOME/Android/Sdk" > local.properties
 ```
 
 Needs the Android SDK and an emulator or device, plus a running
-[PurePrivacy desktop](../pureprivacy-desktop) box to pair with. See
+[Privacy Bolt desktop](../privacy-lodge) box to pair with. See
 [`apps/android/README.md`](apps/android/README.md) for the full toolchain and the
 QR-pairing/call walkthrough.
 

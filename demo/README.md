@@ -1,4 +1,4 @@
-# PurePrivacy — recordable demo
+# Privacy Bolt — recordable demo
 
 Tooling to screen-record the full flow on the two local emulators + test boxes:
 **box setup → alice logs into box1 → bob logs into box2 → QR/connect → call**.

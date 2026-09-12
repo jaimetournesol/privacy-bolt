@@ -1,6 +1,6 @@
-# Publishing PurePrivacy on Google Play — checklist
+# Publishing Privacy Bolt on Google Play — checklist
 
-Everything needed to get the Android app (`ai.tournesol.pureprivacy`) onto Google Play, under
+Everything needed to get the Android app (`ai.tournesol.privacybolt`) onto Google Play, under
 the **Tournesol** organization. Docs in this folder:
 
 - [`PRIVACY-POLICY.md`](PRIVACY-POLICY.md) — the privacy policy (needs hosting at a public URL).

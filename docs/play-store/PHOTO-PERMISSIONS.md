@@ -25,7 +25,7 @@ turn it on — not at install, and not for any other feature.
 ## The justification (paste into Console)
 
 ```
-PurePrivacy is a self-hosted backup and messaging app. Users run their own private server
+Privacy Bolt is a self-hosted backup and messaging app. Users run their own private server
 (a "box") and the app backs their data up to it over Tor, end-to-end encrypted. The developer
 operates no servers and receives no user data.
 
