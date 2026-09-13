@@ -2,10 +2,20 @@ package ai.tournesol.privacybolt.tor
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlin.coroutines.coroutineContext
 import java.io.File
 
 /**
@@ -29,6 +39,10 @@ object TorManager {
     private val _state = MutableStateFlow<State>(State.Idle)
     val state: StateFlow<State> = _state
 
+    private val lifecycleLock = Any()
+    private val transition = Mutex()
+    private val owner = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var readerJob: Job? = null
     @Volatile private var process: Process? = null
     // Bumped on every start()/retry(). A start() invocation only writes _state while it
     // owns the current generation — so a stale loop tearing down after a retry() can't
@@ -38,11 +52,24 @@ object TorManager {
     /** Returns the SDK proxy URL once Tor is ready. */
     val proxyUrl: String get() = "socks5h://127.0.0.1:$SOCKS_PORT"
 
-    suspend fun start(ctx: Context) = withContext(Dispatchers.IO) {
-        if (process != null && _state.value is State.Ready) return@withContext
-        val gen = ++generation
-        fun setState(s: State) { if (gen == generation) _state.value = s }
+    suspend fun start(ctx: Context) {
+        transition.withLock {
+            synchronized(lifecycleLock) {
+                if (readerJob?.isActive == true) return
+                val gen = ++generation
+                _state.value = State.Bootstrapping(0, "starting")
+                readerJob = owner.launch { runTor(ctx.applicationContext, gen) }
+            }
+        }
+    }
+
+    private suspend fun runTor(ctx: Context, gen: Long) = withContext(Dispatchers.IO) {
+        fun setState(s: State) = synchronized(lifecycleLock) {
+            if (gen == generation) _state.value = s
+        }
+        var ownedProcess: Process? = null
         try {
+            coroutineContext.ensureActive()
             setState(State.Bootstrapping(0, "starting"))
             val torExe = findTorExecutable(ctx)
                 ?: run { setState(State.Failed("libtor.so not found in nativeLibraryDir")); return@withContext }
@@ -72,8 +99,13 @@ object TorManager {
                 .redirectErrorStream(true)
                 .directory(dataDir)
             pb.environment()["HOME"] = dataDir.absolutePath
+            coroutineContext.ensureActive()
             val proc = pb.start()
-            process = proc
+            ownedProcess = proc
+            synchronized(lifecycleLock) {
+                if (gen != generation) return@withContext
+                process = proc
+            }
 
             // Parse tor's notice log for bootstrap progress.
             proc.inputStream.bufferedReader().use { reader ->
@@ -103,10 +135,19 @@ object TorManager {
             // Only fault if WE'RE still the live generation and didn't reach Ready — a
             // retry() that killed this process has already bumped the generation, so
             // setState here is a no-op and won't stomp the new bootstrap.
-            if (gen == generation && _state.value !is State.Ready) setState(State.Failed("tor exited ($code)"))
+            if (gen == generation) setState(State.Failed("Private network stopped ($code). Tap retry to reconnect."))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (t: Throwable) {
             Log.e(TAG, "tor start failed", t)
             setState(State.Failed(t.message ?: t.toString()))
+        } finally {
+            withContext(NonCancellable + Dispatchers.IO) {
+                ownedProcess?.let { stopAndReap(it) }
+                synchronized(lifecycleLock) {
+                    if (process === ownedProcess) process = null
+                }
+            }
         }
     }
 
@@ -161,12 +202,9 @@ object TorManager {
      *  bootstrap. Safe to call repeatedly: a Ready Tor is left alone; otherwise we
      *  kill the old `tor` exec (whose log-reader loop in start() then unblocks and
      *  returns) and re-run start(), which resets state to Bootstrapping(0). */
-    suspend fun retry(ctx: Context) = withContext(Dispatchers.IO) {
-        if (_state.value is State.Ready && process != null) return@withContext
-        Log.i(TAG, "Tor retry requested — restarting")
-        runCatching { process?.destroy() }
-        process = null
-        _state.value = State.Bootstrapping(0, "retrying")
+    suspend fun retry(ctx: Context) {
+        if (_state.value is State.Ready && process?.isAlive == true) return
+        stop()
         start(ctx)
     }
 
@@ -175,17 +213,29 @@ object TorManager {
      * do. Needed when the client-auth directory changes: tor reads it only at startup, so a
      * healthy tor that hasn't seen the new key is exactly the case we must interrupt.
      */
-    suspend fun restart(ctx: Context) = withContext(Dispatchers.IO) {
-        Log.i(TAG, "Tor restart requested (client auth changed)")
-        runCatching { process?.destroy() }
-        process = null
-        _state.value = State.Bootstrapping(0, "restarting")
+    suspend fun restart(ctx: Context) {
+        stop()
         start(ctx)
     }
 
-    fun stop() {
-        process?.destroy()
-        process = null
-        _state.value = State.Idle
+    /** Completion means both the process and its reader are gone. A cancelled caller
+     * still finishes teardown; a new start waits before reusing ports or data files. */
+    suspend fun stop() = withContext(NonCancellable + Dispatchers.IO) {
+        transition.withLock {
+            val (oldProcess, oldReader) = synchronized(lifecycleLock) {
+                ++generation
+                _state.value = State.Idle
+                process to readerJob
+            }
+            oldReader?.cancel()
+            oldProcess?.let { stopAndReap(it) }
+            // A cancelled start may have spawned just before publishing its process.
+            // Its finally owns that process, so joining also covers this race.
+            oldReader?.join()
+            synchronized(lifecycleLock) {
+                process = null
+                readerJob = null
+            }
+        }
     }
 }

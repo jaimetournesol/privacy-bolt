@@ -119,7 +119,15 @@ class IncomingCallActivity : ComponentActivity() {
             while (!MatrixRepo.isLoggedIn && w < 60) { delay(500); w++ }
             w = 0
             while (MatrixRepo.rooms.value.none { it.id == roomId } && w < 40) { delay(500); w++ }
-            runCatching { MatrixRepo.openRoom(roomId) }
+            try {
+                MatrixRepo.openRoom(roomId)
+            } catch (error: Exception) {
+                if (error is kotlinx.coroutines.CancellationException) return@launch
+                android.widget.Toast.makeText(this@IncomingCallActivity,
+                    "Couldn't open the call. Reconnect and try again.", android.widget.Toast.LENGTH_LONG).show()
+                finish()
+                return@launch
+            }
             // Put the chat behind the call so ending the call returns there.
             startActivity(Intent(this@IncomingCallActivity, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP

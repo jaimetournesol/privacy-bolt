@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.PrivacyBolt" parent="android:Theme.Material.NoActionBar">
-        <item name="android:statusBarColor">#16140F</item>
-        <item name="android:navigationBarColor">#16140F</item>
-        <item name="android:windowBackground">#16140F</item>
+    <style name="Theme.PrivacyBolt.Base" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#F7F2E9</item>
+        <item name="android:navigationBarColor">#42392F</item>
+        <item name="android:windowBackground">#F7F2E9</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:colorAccent">#9A4A32</item>
     </style>
+    <style name="Theme.PrivacyBolt" parent="Theme.PrivacyBolt.Base" />
 </resources>

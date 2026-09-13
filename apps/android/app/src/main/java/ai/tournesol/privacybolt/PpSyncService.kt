@@ -61,6 +61,13 @@ class PpSyncService : Service() {
     override fun onCreate() {
         super.onCreate()
         ensureChannels(this)
+        BackgroundSyncWorker.schedule(this)
+        scope.launch {
+            delay(5 * 60 * 60_000L)
+            applicationContext.getSharedPreferences("pp_app", Context.MODE_PRIVATE).edit().putBoolean("background_limited", true).apply()
+            MatrixRepo.pauseSync()
+            stopSelf()
+        }
         // [C4] Reflect the real state right away — after a process-kill restart we are NOT
         // connected yet, so don't flash a misleading "Connected" before onStartCommand.
         startForegroundCompat(if (MatrixRepo.isLoggedIn) "Connected over Tor" else "Reconnecting over Tor…")
@@ -92,7 +99,7 @@ class PpSyncService : Service() {
         } else {
             startForegroundCompat(if (MatrixRepo.isLoggedIn) "Connected over Tor" else "Reconnecting over Tor…")
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     /** [C4] Re-establish the Matrix session after an OS process kill, mirroring
@@ -106,6 +113,7 @@ class PpSyncService : Service() {
         scope.launch {
             try {
                 // Bounded wait for Tor (it starts via PpApp/AppViewModel); don't block forever.
+                TorManager.start(applicationContext)
                 var waited = 0
                 while (TorManager.state.value !is TorManager.State.Ready && waited < 120) {
                     if (MatrixRepo.isLoggedIn) return@launch     // app restored it first
@@ -224,6 +232,14 @@ class PpSyncService : Service() {
         return PendingIntent.getActivity(this, roomId?.hashCode() ?: 0, i, pf)
     }
 
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        getSharedPreferences("pp_app", Context.MODE_PRIVATE).edit().putBoolean("background_limited", true).apply()
+        // Android grants only a few seconds here. Stop immediately; bounded WorkManager
+        // catch-up resumes independently and never starts another foreground service.
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         backupObserver?.let { runCatching { contentResolver.unregisterContentObserver(it) } }
@@ -239,6 +255,7 @@ class PpSyncService : Service() {
         const val EXTRA_ANSWER = "pp_answer_call"
 
         fun start(ctx: Context) {
+            ctx.getSharedPreferences("pp_app", Context.MODE_PRIVATE).edit().putBoolean("background_limited", false).apply()
             val i = Intent(ctx, PpSyncService::class.java)
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
         }

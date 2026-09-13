@@ -9,6 +9,7 @@ import androidx.documentfile.provider.DocumentFile
 import ai.tournesol.privacybolt.matrix.MatrixRepo
 import ai.tournesol.privacybolt.tor.TorManager
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.util.concurrent.atomic.AtomicBoolean
@@ -51,6 +52,7 @@ object BackupSyncManager {
      * Mirrors PpSyncService.reviveSession. Returns true once logged in. Bounded so it never hangs.
      */
     suspend fun ensureSession(ctx: Context): Boolean {
+        if (ctx.getSharedPreferences("pp_app", Context.MODE_PRIVATE).getBoolean("paused", false)) return false
         if (MatrixRepo.isLoggedIn) return true
         if (!MatrixRepo.hasSavedSession(ctx)) return false
         runCatching { TorManager.start(ctx) }
@@ -75,12 +77,13 @@ object BackupSyncManager {
         try {
             BackupSyncStore.ensureLoaded(ctx)
             if (!MatrixRepo.isLoggedIn) return Result.NotReady
+            val account = MatrixRepo.userId
             val room = MatrixRepo.ensureBackupRoom() ?: return Result.NotReady
             var uploaded = 0; var failed = 0; var skipped = 0
 
             for (src in BackupSyncStore.snapshot(ctx).filter { it.enabled }) {
                 val items = enumerate(ctx, src)
-                    .filter { it.key !in src.boundaryKeys }
+                    .filter { it.modifiedMs != src.watermarkMs || it.key !in src.boundaryKeys }
                     .sortedBy { it.modifiedMs }
                 if (items.isEmpty()) continue
                 syncingCount.value += items.size
@@ -91,14 +94,11 @@ object BackupSyncManager {
                 var stopped = false
 
                 for (item in items) {
-                    if (item.sizeBytes > MatrixRepo.MAX_BACKUP_BYTES) {
-                        // Can't ship it — record we've moved past it so it isn't re-scanned forever.
-                        Log.w(TAG, "skip oversized ${item.uri} (${item.sizeBytes} B)")
-                        skipped++
-                        wm = advance(wm, boundary, item)
-                        sinceFlush++
-                        syncingCount.value = (syncingCount.value - 1).coerceAtLeast(0)
-                        continue
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    if (MatrixRepo.userId != account || !MatrixRepo.isLoggedIn
+                        || ctx.getSharedPreferences("pp_app", Context.MODE_PRIVATE).getBoolean("paused", false)) return Result.NotReady
+                    if (item.sizeBytes > MatrixRepo.MAX_CHUNKED_BYTES) {
+                        failed++; stopped = true; break
                     }
                     val ok = runCatching { MatrixRepo.backupUpload(ctx, room, item.uri) }.getOrDefault(false)
                     syncingCount.value = (syncingCount.value - 1).coerceAtLeast(0)
@@ -117,7 +117,8 @@ object BackupSyncManager {
                 BackupSyncStore.updateProgress(ctx, src.id, wm, boundary)
                 if (stopped) { syncingCount.value = 0; break }
             }
-            BackupSyncStore.markSynced(ctx, System.currentTimeMillis())
+            if (failed == 0 && skipped == 0 && MatrixRepo.userId == account)
+                BackupSyncStore.markSynced(ctx, System.currentTimeMillis())
             Log.i(TAG, "pass done: up=$uploaded fail=$failed skip=$skipped")
             return Result.Done(uploaded, failed, skipped)
         } finally {

@@ -2,6 +2,9 @@ package ai.tournesol.privacybolt.matrix
 
 import android.util.Log
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
@@ -50,6 +53,8 @@ class ConsentRepository {
     var lastReadMs: Long = 0L
         private set
 
+    fun clear() { synchronized(onions) { onions.clear() }; lastReadMs = 0 }
+
     /** True iff [onion] is non-null and currently consented. */
     operator fun contains(onion: String?): Boolean =
         onion != null && synchronized(onions) { onion in onions }
@@ -57,17 +62,9 @@ class ConsentRepository {
     /** Load consent from authoritative account-data, REPLACING the in-memory set
      *  (clear + fill). Best-effort: a failed/empty read keeps the existing set, so a
      *  transient Tor read never drops consent. Re-run on every RUNNING sync cycle. */
-    suspend fun load(c: Client) {
-        val raw = runCatching { c.accountData(ACCOUNT_DATA_TYPE) }.getOrNull() ?: return
-        runCatching {
-            val arr = JSONObject(raw).optJSONArray("onions") ?: return
-            val fresh = mutableSetOf<String>()
-            for (i in 0 until arr.length()) fresh.add(arr.getString(i))
-            synchronized(onions) {
-                onions.clear()
-                onions.addAll(fresh)
-            }
-        }
+    suspend fun load(c: Client) = ioLock.withLock {
+        val fresh = readArray(c) ?: return@withLock
+        synchronized(onions) { onions.clear(); onions.addAll(fresh) }
         lastReadMs = System.currentTimeMillis()
     }
 
@@ -77,7 +74,7 @@ class ConsentRepository {
      *  successful PUT (retried over flaky Tor). Returns true once persisted, or if it
      *  was already recorded. */
     suspend fun record(c: Client, onion: String): Boolean = ioLock.withLock {
-        if (contains(onion)) return@withLock true // already recorded AND persisted
+        if (!onion.matches(Regex("[a-z2-7]{56}\\.onion"))) return@withLock false
         // Build the write from a SUCCESSFUL read only — a failed read must never become an
         // empty base set, or we'd PUT {this-onion-only} and the box would drop every other
         // paired contact from its federation allowlist. The read happens INSIDE ioLock, so a
@@ -91,7 +88,7 @@ class ConsentRepository {
         val json = JSONObject().put("onions", JSONArray(set.toList())).toString()
         for (attempt in 1..WRITE_RETRIES) {
             if (runCatching { c.setAccountData(ACCOUNT_DATA_TYPE, json) }.isSuccess) {
-                onions.addAll(set)
+                synchronized(onions) { onions.clear(); onions.addAll(set) }
                 Log.i(TAG, "recorded $onion (attempt $attempt)")
                 return@withLock true
             }
@@ -144,17 +141,39 @@ class ConsentRepository {
      *  account-data yet). Callers MUST NOT build a write from a null: doing so would PUT a
      *  set derived from a failed read, and since the box treats `…pairings` as
      *  authoritative, that would de-federate every previously-paired contact. */
-    private suspend fun readArray(c: Client): LinkedHashSet<String>? {
-        val res = runCatching { c.accountData(ACCOUNT_DATA_TYPE) }
-        if (res.isFailure) return null                       // read failed — caller must abort
-        val raw = res.getOrNull() ?: return linkedSetOf()    // genuinely absent → empty is correct
-        val set = linkedSetOf<String>()
+    private suspend fun readArray(c: Client): LinkedHashSet<String>? = withContext(Dispatchers.IO) {
+        var phase = "session"
         runCatching {
-            JSONObject(raw).optJSONArray("onions")?.let { a ->
-                for (i in 0 until a.length()) set.add(a.getString(i))
+            val session = c.session()
+            phase = "address"
+            val base = session.homeserverUrl.toHttpUrl()
+            require(base.host.matches(Regex("[a-z2-7]{56}\\.onion")))
+            val url = base.newBuilder().addPathSegments("_matrix/client/v3/user")
+                .addPathSegment(session.userId).addPathSegment("account_data")
+                .addPathSegment(ACCOUNT_DATA_TYPE).build()
+            val transport = okhttp3.OkHttpClient.Builder()
+                .proxy(java.net.Proxy(java.net.Proxy.Type.SOCKS, java.net.InetSocketAddress("127.0.0.1", ai.tournesol.privacybolt.tor.TorManager.SOCKS_PORT)))
+                .followRedirects(false).followSslRedirects(false)
+                .callTimeout(30, java.util.concurrent.TimeUnit.SECONDS).build()
+            phase = "request"
+            transport.newCall(okhttp3.Request.Builder().url(url).header("Authorization", "Bearer ${session.accessToken}").build()).execute().use { response ->
+                phase = "response ${response.code}"
+                if (response.code == 404) return@use linkedSetOf<String>()
+                check(response.isSuccessful)
+                val source = response.body?.source() ?: error("Missing pairing data")
+                source.request(65537)
+                check(source.buffer.size <= 65536)
+                phase = "data"
+                val array = JSONObject(source.readUtf8()).getJSONArray("onions")
+                linkedSetOf<String>().also { set ->
+                    for (i in 0 until array.length()) {
+                        val onion = array.getString(i)
+                        require(onion.matches(Regex("[a-z2-7]{56}\\.onion")))
+                        set.add(onion)
+                    }
+                }
             }
-        }
-        return set
+        }.onFailure { Log.w(TAG, "Pairing read failed at $phase (${it.javaClass.simpleName})") }.getOrNull()
     }
 
     /** Read the account-data set, retrying the READ over flaky Tor. Returns null only if

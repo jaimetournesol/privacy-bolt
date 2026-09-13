@@ -15,13 +15,18 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.Job
 import ai.tournesol.privacybolt.matrix.MatrixRepo
 import ai.tournesol.privacybolt.net.TorNet
 import ai.tournesol.privacybolt.tor.TorManager
 import java.io.ByteArrayInputStream
 
 /**
- * Agent settings — the Hermes WebUI, on your box, over Tor.
+ * Agent settings — the Hermes WebUI, on Lodge, over Tor.
  *
  * This is the agents' control plane: create and configure agents, pick models, watch runs.
  * It is deliberately NOT part of the Agents app's chat surface — talking to an agent and
@@ -46,6 +51,13 @@ class AgentSettingsActivity : ComponentActivity() {
     private val TAG = "PpAgentUI"
     private lateinit var web: WebView
     private var status: TextView? = null
+    private var entryUrl = ""
+    private val ownedPorts = mutableSetOf<Int>()
+    private var agentnodeMode = false
+    private var loadWatch: Job? = null
+    private var loadGeneration = 0
+    private var pageReady = false
+    private var retryButton: android.widget.Button? = null
 
     companion object {
         /** Loopback port for the bridge to the agent WebUI's onion. Distinct from the call
@@ -96,6 +108,10 @@ class AgentSettingsActivity : ComponentActivity() {
         // The agents' control plane is exactly the kind of screen that shouldn't end up in
         // a screen recording or the recents thumbnail.
         applyScreenSecurity()
+        if (AccountPrivacy.gate.value != Gate.Open) { finish(); return }
+        lifecycleScope.launch {
+            AccountPrivacy.gate.collect { if (it != Gate.Open) finish() }
+        }
 
         val webui = MatrixRepo.agentWebui.value
         if (webui == null || webui.onion.isBlank()) {
@@ -103,7 +119,7 @@ class AgentSettingsActivity : ComponentActivity() {
             // published by the box and arrives with sync.
             Log.w(TAG, "no agent WebUI published yet — finishing")
             android.widget.Toast.makeText(
-                this, "Your box hasn't published the agent settings address yet.",
+                this, "Lodge hasn't published the agent settings address yet.",
                 android.widget.Toast.LENGTH_LONG,
             ).show()
             finish(); return
@@ -117,7 +133,20 @@ class AgentSettingsActivity : ComponentActivity() {
         // Tunnel: plain TCP to the agent onion. Raw TCP (not the HTTP-CONNECT tunnel),
         // because that tunnel is TLS-only and this hop is plain HTTP inside the onion's
         // own encryption — the transport is already end-to-end to the box.
+        val agentnode = webui.backend == "agentnode"
+        agentnodeMode = agentnode
+        entryUrl = "http://127.0.0.1:$AGENT_LOCAL/" + if (agentnode)
+            "?lodge=1#token=${android.net.Uri.encode(password)}" else ""
+        ownedPorts.add(AGENT_LOCAL)
         TorNet.startTcpForwarder(AGENT_LOCAL, { webui.onion }, webui.port, TorManager.SOCKS_PORT)
+        if (agentnode) {
+            for (slot in 0..16) {
+                val local = 18788 + slot
+                val remote = 8789 + slot
+                ownedPorts.add(local)
+                TorNet.startTcpForwarder(local, { webui.onion }, remote, TorManager.SOCKS_PORT)
+            }
+        }
 
         val root = FrameLayout(this)
         web = WebView(this)
@@ -130,6 +159,9 @@ class AgentSettingsActivity : ComponentActivity() {
         with(web.settings) {
             javaScriptEnabled = true
             domStorageEnabled = true
+            allowFileAccess = false
+            allowContentAccess = false
+            setSupportMultipleWindows(false)
             // The WebUI streams over WebSocket to the same origin; both ride the bridge.
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             mediaPlaybackRequiresUserGesture = true
@@ -175,7 +207,7 @@ class AgentSettingsActivity : ComponentActivity() {
                 v: WebView?, req: WebResourceRequest?,
             ): WebResourceResponse? {
                 val host = req?.url?.host ?: return null
-                if (host == "127.0.0.1" || host == "localhost") return null
+                if (host == "127.0.0.1" && req.url.port in ownedPorts && req.url.scheme in setOf("http", "https")) return null
                 Log.i(TAG, "blocked off-Tor request to $host")
                 return WebResourceResponse(
                     "text/plain", "utf-8", 403, "Blocked",
@@ -183,9 +215,20 @@ class AgentSettingsActivity : ComponentActivity() {
                 )
             }
 
+            override fun shouldOverrideUrlLoading(v: WebView?, req: WebResourceRequest?): Boolean {
+                val uri = req?.url ?: return true
+                if (uri.scheme == "https" && uri.host == "auth.openai.com" && uri.path == "/codex/device") {
+                    startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, uri))
+                    return true
+                }
+                return uri.host != "127.0.0.1" || uri.port !in ownedPorts || uri.scheme != "http"
+            }
+
             override fun onPageFinished(v: WebView?, url: String?) {
-                status?.let { it.visibility = View.GONE }
-                overlay?.visibility = View.GONE
+                if (!agentnodeMode && url?.startsWith("http://127.0.0.1:$AGENT_LOCAL/") == true) {
+                    pageReady = true
+                    overlay?.visibility = View.GONE
+                }
                 if (url != null && url.contains("/login")) fillPassword(password)
             }
 
@@ -198,7 +241,38 @@ class AgentSettingsActivity : ComponentActivity() {
             }
         }
 
-        web.loadUrl("http://127.0.0.1:$AGENT_LOCAL/")
+        loadPage()
+    }
+
+    private fun loadPage() {
+        loadWatch?.cancel()
+        val generation = ++loadGeneration
+        pageReady = false
+        status?.text = "Opening Conductor over Tor…"
+        overlay?.visibility = View.VISIBLE
+        overlayProgress?.visibility = View.VISIBLE
+        retryButton?.visibility = View.GONE
+        web.setBackgroundColor(0xFFF7F2E9.toInt())
+        web.loadUrl(entryUrl)
+        loadWatch = lifecycleScope.launch {
+            val deadline = android.os.SystemClock.elapsedRealtime() + 90_000
+            while (isActive && !isFinishing && !pageReady && android.os.SystemClock.elapsedRealtime() < deadline) {
+                delay(500)
+                if (agentnodeMode) web.evaluateJavascript("typeof lodgeUI !== 'undefined' && lodgeUI.ready === true && !!document.getElementById('lodgeNav')") { ready ->
+                    if (generation == loadGeneration && ready == "true") {
+                        pageReady = true; overlay?.visibility = View.GONE; loadAttempts = 0
+                    }
+                }
+            }
+            if (!pageReady && generation == loadGeneration && !isFinishing) {
+                ++loadGeneration // ignore late callbacks and retry timers from this attempt
+                web.stopLoading()
+                status?.text = "Conductor hasn't finished loading. Check that Lodge is running, then try again."
+                overlayProgress?.visibility = View.GONE
+                retryButton?.visibility = View.VISIBLE
+                overlay?.visibility = View.VISIBLE
+            }
+        }
     }
 
     /**
@@ -219,7 +293,7 @@ class AgentSettingsActivity : ComponentActivity() {
      * bands read as part of the page rather than as letterboxing.
      */
     private fun insetForSystemBars(root: View) {
-        root.setBackgroundColor(0xFF141425.toInt())   // Hermes WebUI chrome
+        root.setBackgroundColor(0xFFF7F2E9.toInt())
         androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
             val bars = insets.getInsets(
                 androidx.core.view.WindowInsetsCompat.Type.systemBars() or
@@ -241,16 +315,17 @@ class AgentSettingsActivity : ComponentActivity() {
     private fun retryOrGiveUp() {
         loadAttempts++
         if (loadAttempts >= maxLoadAttempts) {
-            status?.text = "Couldn't reach your agents' settings.\n" +
-                "Your box may still be starting them — try again in a moment."
+            status?.text = "Couldn't reach Conductor. Lodge may still be starting."
             overlayProgress?.visibility = View.GONE
+            retryButton?.visibility = View.VISIBLE
             overlay?.visibility = View.VISIBLE
             return
         }
-        status?.text = "Your box is still starting the agent settings…"
+        status?.text = "Conductor is still starting. Retrying the connection…"
         overlay?.visibility = View.VISIBLE
         overlayProgress?.visibility = View.VISIBLE
-        web.postDelayed({ web.loadUrl("http://127.0.0.1:$AGENT_LOCAL/") }, 5_000)
+        val generation = loadGeneration
+        web.postDelayed({ if (!isFinishing && !isDestroyed && generation == loadGeneration) loadPage() }, 5_000)
     }
 
     private var overlay: LinearLayout? = null
@@ -262,18 +337,23 @@ class AgentSettingsActivity : ComponentActivity() {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setBackgroundColor(0xFF16140F.toInt())   // Ink, as in the Compose theme
+            setBackgroundColor(0xFFF7F2E9.toInt())   // Ink, as in the Compose theme
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
         }
         box.addView(ProgressBar(this).also { overlayProgress = it })
         box.addView(TextView(this).apply {
-            text = "Connecting to your box over Tor…"
-            setTextColor(0xFFECE6D7.toInt())         // Paper
+            text = "Opening Conductor over Tor…"
+            setTextColor(0xFF42392F.toInt())         // Paper
             gravity = Gravity.CENTER
             setPadding(0, 32, 0, 0)
             status = this
         })
+        box.addView(android.widget.Button(this).apply {
+            text = "Try again"; visibility = View.GONE; retryButton = this
+            setOnClickListener { loadAttempts = 0; loadPage() }
+        })
+        box.addView(android.widget.Button(this).apply { text = "Back to Privacy Bolt"; setOnClickListener { finish() } })
         overlay = box
         return box
     }
@@ -306,13 +386,14 @@ class AgentSettingsActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        // Leave the Tor forwarder alone: TorNet keys listeners by port and reuses them, and
-        // a call may be running on its own bridges. It's torn down with the rest by
-        // TorNet.stopAll() on sign-out.
+        ++loadGeneration
+        loadWatch?.cancel()
+        // This screen owns its bridges; calls use a separate set of ports.
         // Never leave a file-input callback unanswered — Chromium holds the native side open.
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
-        runCatching { web.destroy() }
+        ownedPorts.forEach { TorNet.stopPort(it) }
+        runCatching { web.stopLoading(); web.loadUrl("about:blank"); web.clearHistory(); web.destroy() }
         super.onDestroy()
     }
 }

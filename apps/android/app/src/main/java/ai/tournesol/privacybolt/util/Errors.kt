@@ -73,7 +73,7 @@ fun mapError(t: Throwable): String {
             "connectiontimeout", "could not reach", "error sending request",
             "no route", "host", "os error 111", "os error 110", "dns", "not found",
             "name or service") ->
-            "Couldn't reach your box. It may be asleep — make sure it's running, then try again."
+            "Couldn't reach Lodge. It may be asleep — make sure it's running, then try again."
 
         // Everything else: most likely just slow/flaky Tor on this attempt.
         else ->

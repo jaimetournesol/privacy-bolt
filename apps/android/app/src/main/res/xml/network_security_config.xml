@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  [C3] Fail-closed cleartext policy. Replaces the blanket android:usesCleartextTraffic="true"
-  in the manifest. The ONLY cleartext (plain http/ws) the platform networking stack ever
-  needs is to 127.0.0.1: the Element Call WebView talks to our loopback bridges over plain
-  http/ws (TorNet), and those bridges TLS-tunnel to the box's .onion over Tor on the far
-  side. Everything else (the box client API over Tor, the call.element.io bundle) is reached
-  by the native matrix-rust-sdk / OkHttp over https — none of it needs cleartext.
+  [C3] Scoped cleartext policy. Loopback serves the local call bridges. Onion HTTP
+  serves the box client API inside Tor's authenticated, encrypted onion circuit.
+  ConsentRepository uses OkHttp for bounded account-data reads, with an explicit
+  Tor SOCKS proxy, strict v3 onion validation and redirects disabled. It therefore
+  needs the onion exception too; blocking it silently prevents contact pairing.
+  Clearnet destinations (including the Element Call bundle) still require HTTPS.
 
   NB: the matrix-rust-sdk is a native (Rust/reqwest) library and is NOT governed by this
   policy at all; its http://<onion>:8008 client-API calls go out over the Tor SOCKS proxy
@@ -19,5 +19,11 @@
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">127.0.0.1</domain>
         <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+
+    <!-- Transport encryption/authentication comes from the onion circuit.
+         Callers must use Tor and validate the complete v3 onion address. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">onion</domain>
     </domain-config>
 </network-security-config>
