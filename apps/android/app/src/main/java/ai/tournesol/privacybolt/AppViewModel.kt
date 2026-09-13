@@ -9,6 +9,7 @@ import ai.tournesol.privacybolt.security.PasscodeStore
 import ai.tournesol.privacybolt.tor.TorManager
 import ai.tournesol.privacybolt.util.mapError
 import android.util.Log
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,7 +32,7 @@ sealed class Screen {
     data object Config : Screen()
     /** Backup Sync — sync phone files to the box + browse/download (feature F). */
     data object Files : Screen()
-    /** Agents — the AI agents your box runs, grouped. Deliberately its OWN app, not a
+    /** Agents — the AI agents Lodge runs, grouped. Deliberately its OWN app, not a
      *  section of Messaging: people must always know whether they're talking to a human
      *  or an AI, and a shared list can't carry that guarantee. */
     data object Agents : Screen()
@@ -75,6 +76,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val torState = TorManager.state
     val rooms = MatrixRepo.rooms
     val messages = MatrixRepo.messages
+    val chatTimeline = MatrixRepo.chatTimeline
     val status = MatrixRepo.status
 
     val screen = MutableStateFlow<Screen>(Screen.Splash)
@@ -86,7 +88,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // --- Passcode gate (feature C) -------------------------------------------------------
     /** Drawn in front of [screen] by MainActivity. See [Gate]. */
-    val gate = MutableStateFlow(Gate.Open)
+    val gate = AccountPrivacy.gate
     /** Transient lock-screen error ("Wrong code"). The LockScreen clears its dots on change. */
     val lockError = MutableStateFlow<String?>(null)
     /** Epoch-ms until which entry is locked out after wrong attempts (0 = not locked out).
@@ -150,6 +152,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             when (PasscodeStore.verify(app, code)) {
                 PasscodeStore.Verdict.UNLOCK -> {
                     lockError.value = null; lockoutUntilMs.value = 0L; gate.value = Gate.Open
+                    consumePendingContact()
                 }
                 PasscodeStore.Verdict.DURESS, PasscodeStore.Verdict.WIPE -> duressWipe()
                 PasscodeStore.Verdict.WRONG -> {
@@ -174,29 +177,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             PasscodeStore.setCodes(app, unlock, duress)
             lockError.value = null
             gate.value = Gate.Open
+            consumePendingContact()
         }
     }
 
-    /** Duress self-destruct: wipe ALL local app data (session + crypto store via a
-     *  local-first [MatrixRepo.duressWipe], Tor data dir, caches, and the passcodes) and
-     *  land on a neutral Login — no indication a wipe happened. Irreversible. */
-    private fun duressWipe() {
-        val app = getApplication<Application>()
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { PpSyncService.stop(app) }
-            runCatching { MatrixRepo.duressWipe(app) }       // local-first: session + crypto store
-            runCatching { TorManager.stop() }
-            runCatching { java.io.File(app.filesDir, "tor").deleteRecursively() }  // guards + descriptor cache
-            runCatching { app.cacheDir.deleteRecursively() }                       // cached media/thumbs
-            PasscodeStore.clear(app)                          // forget the codes too
-            isPaused = false; paused.value = false
-            lockError.value = null; lockoutUntilMs.value = 0L
-            gate.value = Gate.Open                            // reveal the neutral Login underneath
-            screen.value = Screen.Login
-            // Re-boot Tor for the next sign-in (its data dir was just wiped → fresh guards).
-            viewModelScope.launch(Dispatchers.IO) { runCatching { TorManager.start(app) } }
-        }
-    }
+    /** Android force-stops the package before clearing its data, permissions and jobs.
+     * No SDK/network teardown may delay this request or repersist a session afterwards.
+     * The next manual launch starts without an account or passcodes. */
+    private fun duressWipe() = eraseDevice()
 
     /** How the cold-start session restore is going, for the SplashScreen. A RETURNING
      *  user (saved session) must never silently fall through to a bare login form, so
@@ -230,6 +218,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // start — the lock is drawn over whatever the restore below reaches, so it never
         // interferes with restore. A configured-but-locked-out relaunch restores the
         // countdown from the persisted lockout timestamp.
+        gate.value = if (PasscodeStore.isConfigured(getApplication())) Gate.Locked else Gate.Open
         if (PasscodeStore.isConfigured(getApplication())) {
             gate.value = Gate.Locked
             lockoutUntilMs.value = System.currentTimeMillis() + PasscodeStore.lockoutRemainingMs(getApplication())
@@ -248,10 +237,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // "Reconnecting" with a dead token. Transient/soft errors never set this.
         viewModelScope.launch {
             MatrixRepo.authExpired.collect { expired ->
-                if (expired && screen.value !is Screen.Login) {
-                    restoring = false
-                    error.value = "You were signed out. Please sign in again."
-                    screen.value = Screen.Login
+                if (expired) {
+                    try {
+                        withContext(Dispatchers.IO) { PasscodeStore.clear(getApplication()) }
+                        restoring = false
+                        error.value = "You were signed out. Please sign in again."
+                        screen.value = Screen.Login
+                        gate.value = Gate.Open
+                    } catch (_: Exception) {
+                        gate.value = Gate.Locked
+                        lockError.value = "Couldn't finish signing out. Clear app storage in Android Settings."
+                    }
                 }
             }
         }
@@ -289,25 +285,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 // Restore can stall when Tor is flaky (the SDK runs a networked sliding-sync
                 // discovery during client build). Bound each attempt; on the second slow
                 // attempt escalate to the recoverable splash instead of looping silently.
-                var restored = false
+                var restored: ai.tournesol.privacybolt.matrix.SessionFence.Ticket? = null
                 for (attempt in 1..2) {
                     if (attempt == 2) restorePhase.value = RestorePhase.Slow
                     val ok = kotlinx.coroutines.withTimeoutOrNull(30_000) {
-                        runCatching { MatrixRepo.tryRestore(getApplication()) }.getOrDefault(false)
+                        runCatching { MatrixRepo.restoreAccount(getApplication()) }.getOrNull()
                     }
-                    if (ok == true) { restored = true; break }
+                    if (ok != null) { restored = ok; break }
                     kotlinx.coroutines.delay(1500)        // brief pause; a new Tor circuit may help
                 }
-                if (restored) {
+                if (restored != null) {
+                    val account = restored
                     runCatching {
-                        MatrixRepo.startSync()
-                        PpSyncService.start(getApplication())
-                        screen.value = Screen.Home
-                        consumePendingContact()
-                        // Upgrade path: an existing user (session restored) with no passcode
-                        // yet is prompted to set one on first launch of this version. If a
-                        // passcode IS set, init() already locked the gate — this is a no-op.
-                        maybePromptSetup()
+                        MatrixRepo.startSync(account)
+                        MatrixRepo.withAccount(account) {
+                            PpSyncService.start(getApplication())
+                            screen.value = Screen.Home
+                            consumePendingContact()
+                            // Existing accounts without codes must configure them on upgrade.
+                            maybePromptSetup()
+                        }
                     }.onFailure {
                         // Sync failed to start — recoverable, not "signed out". Keep the
                         // saved session and offer a retry from the splash.
@@ -361,13 +358,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     kotlinx.coroutines.delay(1000); waited++
                 }
                 val hs = normalizeHomeserver(onion)
-                MatrixRepo.login(getApplication(), hs, user.trim(), pass)
-                MatrixRepo.startSync()
-                PpSyncService.start(getApplication())
-                screen.value = Screen.Home
-                consumePendingContact()
-                maybePromptSetup()   // first sign-in with no passcode -> force setup (feature C)
+                val account = MatrixRepo.login(getApplication(), hs, user.trim(), pass)
+                MatrixRepo.startSync(account)
+                MatrixRepo.withAccount(account) {
+                    PpSyncService.start(getApplication())
+                    screen.value = Screen.Home
+                    consumePendingContact()
+                    maybePromptSetup()
+                }
             } catch (t: Throwable) {
+                if (t is java.util.concurrent.CancellationException) throw t
                 Log.w("AppVM", "login failed", t)
                 error.value = mapError(t)
             } finally {
@@ -481,24 +481,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** A `privacybolt://…` link was opened (system camera scanned a QR, or a tapped
      *  link). Two distinct kinds travel on the same scheme, so route by type:
      *   - `privacybolt://connect?hs=…&user=…&token=…` — the desktop's "Connect your
-     *     phone" SETUP code. This is a sign-in handoff (first-run "your box in your
+     *     phone" SETUP code. This is a sign-in handoff (first-run "Lodge in your
      *     pocket"), NOT a contact — it must go to the login path, never addContact.
      *   - everything else (`privacy-bolt:@name:onion`, `privacybolt://contact/…`, a
      *     bare `@name:onion`) — a CONTACT's code → addContact (unchanged behaviour).
      *  If we're signed in, contacts are added now; otherwise stashed and replayed
      *  once a session is ready, so the link is never lost. */
     private var pendingContact: String? = null
-    fun onDeepLink(uri: String?) {
+    @Synchronized fun onDeepLink(uri: String?) {
         val raw = uri?.trim().orEmpty()
         if (raw.isEmpty()) return
         if (isConnectUri(raw)) { loginFromConnectUri(raw); return }
         if (Regex("[a-z2-7]{56}\\.onion").containsMatchIn(raw).not()) return  // not an address link
-        when (screen.value) {
-            is Screen.Rooms, is Screen.Chat, is Screen.Profile -> addContact(raw)
-            // Splash (restoring) or Login: stash it. The normal flow lands on Rooms
-            // (returning user) or Login→sign-in; consumePendingContact runs at both.
-            else -> pendingContact = raw
-        }
+        pendingContact = raw
+        consumePendingContact()
     }
 
     /** True for the desktop's setup handoff URI: `privacybolt://connect?…`. */
@@ -539,13 +535,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         screen.value = Screen.Login
     }
 
-    private fun consumePendingContact() {
+    @Synchronized private fun consumePendingContact() {
         val p = pendingContact ?: return
+        // Contact links can change federation consent. Keep them pending until
+        // the owner has unlocked a ready session, including on the new Home,
+        // Files, Config and Agents screens. Unlock during restore is not enough.
+        if (!MatrixRepo.isLoggedIn || isPaused || gate.value != Gate.Open ||
+            !PasscodeStore.isConfigured(getApplication())) return
+        when (screen.value) {
+            Screen.Splash, Screen.Login, Screen.Paused -> return
+            else -> Unit
+        }
         pendingContact = null
         addContact(p)
     }
 
-    fun showProfile() { error.value = null; screen.value = Screen.Profile }
+    private var profileReturn: Screen = Screen.Home
+    fun showProfile() {
+        if (screen.value != Screen.Profile) profileReturn = screen.value
+        error.value = null; screen.value = Screen.Profile
+    }
+    fun closeProfile() { error.value = null; screen.value = profileReturn }
     fun openRooms() { error.value = null; screen.value = Screen.Rooms }
 
     // --- Apps grid (feature E) + PP Config (feature B) ----------------------------------
@@ -703,7 +713,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             agentSetupNotice.value = opening
             val id = runCatching { send() }.getOrNull()
             if (id == null) {
-                agentSetupNotice.value = "Couldn't reach your box."
+                agentSetupNotice.value = "Couldn't reach Lodge."
                 agentSetupBusy.value = false
                 return@launch
             }
@@ -713,7 +723,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val outcome = runCatching { MatrixRepo.readCommandOutcome(id) }.getOrNull()
                 if (outcome != null) {
                     agentSetupNotice.value = outcome.message?.takeIf { it.isNotBlank() }
-                        ?: if (outcome.ok) "Done." else "Your box couldn't do that."
+                        ?: if (outcome.ok) "Done." else "Lodge couldn't do that."
                     settled = true
                     break
                 }
@@ -783,9 +793,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             agentSetupBusy.value = true
             agentSetupSucceeded.value = false
             agentSetupNotice.value = if (agentName.isNullOrBlank())
-                "Asking your box to set up agents…"
+                "Asking Lodge to set up agents…"
             else
-                "Asking your box to add ${agentName.trim()}…"
+                "Asking Lodge to add ${agentName.trim()}…"
             // The password rides the command channel, not account data — the box reads it and
             // clears the command immediately, exactly as it does for the backup passphrase.
             // Blank means "keep whatever the box has" (on a fresh install, the one the agent
@@ -802,7 +812,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }.getOrNull()
             if (id == null) {
-                agentSetupNotice.value = "Couldn't reach your box."
+                agentSetupNotice.value = "Couldn't reach Lodge."
                 agentSetupBusy.value = false
                 return@launch
             }
@@ -818,7 +828,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val outcome = runCatching { MatrixRepo.readCommandOutcome(id) }.getOrNull()
                 if (outcome != null) {
                     agentSetupNotice.value = outcome.message?.takeIf { it.isNotBlank() }
-                        ?: if (outcome.ok) "Agents are ready." else "Setup failed on your box."
+                        ?: if (outcome.ok) "Agents are ready." else "Setup failed on Lodge."
                     settled = true
                     if (outcome.ok) agentSetupSucceeded.value = true
                     break
@@ -834,7 +844,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             if (!settled) {
                 agentSetupNotice.value =
-                    "Still working — your box is taking a while. Check back shortly."
+                    "Still working — Lodge is taking a while. Check back shortly."
             }
             runCatching { MatrixRepo.refreshAgents() }
             agentSetupBusy.value = false
@@ -870,12 +880,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun startAgentAuth(provider: String) {
         if (authFlow.value?.done == false) return   // one at a time; a second would race the slot
         viewModelScope.launch(Dispatchers.IO) {
-            authFlow.value = AuthFlow(provider, "Asking your box to start the sign-in…")
+            authFlow.value = AuthFlow(provider, "Asking Lodge to start the sign-in…")
             val id = runCatching {
                 MatrixRepo.sendBoxCommand("agent_auth", provider = provider)
             }.getOrNull()
             if (id == null) {
-                authFlow.value = AuthFlow(provider, "Couldn't reach your box.", done = true)
+                authFlow.value = AuthFlow(provider, "Couldn't reach Lodge.", done = true)
                 return@launch
             }
             var settled = false
@@ -929,12 +939,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) {
             agentSetupBusy.value = true
             agentSetupSucceeded.value = false
-            agentSetupNotice.value = "Asking your box to remove $displayName…"
+            agentSetupNotice.value = "Asking Lodge to remove $displayName…"
             val id = runCatching {
                 MatrixRepo.sendBoxCommand("agent_remove", agentUser = target)
             }.getOrNull()
             if (id == null) {
-                agentSetupNotice.value = "Couldn't reach your box."
+                agentSetupNotice.value = "Couldn't reach Lodge."
                 agentSetupBusy.value = false
                 return@launch
             }
@@ -981,11 +991,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         initBackupSync()
         viewModelScope.launch(Dispatchers.IO) {
             libraryReady.value = false
+            backupNotice.value = null
             val rid = runCatching { MatrixRepo.ensureBackupRoom() }.getOrNull()
-            if (rid == null) { backupNotice.value = "Couldn't reach your box."; return@launch }
+            if (rid == null) { backupNotice.value = "Couldn't reach Lodge."; return@launch }
             _libRoomId.value = rid
-            runCatching { MatrixRepo.openBackupLibrary(rid) }
-            libraryReady.value = true
+            val opened = runCatching { MatrixRepo.openBackupLibrary(rid) }.isSuccess
+            libraryReady.value = opened
+            if (!opened) backupNotice.value = "Couldn’t open your library. Try reconnecting to Lodge."
         }
     }
 
@@ -1013,7 +1025,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             backupUploading.value = 0
             backupNotice.value =
-                if (ok == uris.size) "Backed up $ok ${if (ok == 1) "file" else "files"} to your box."
+                if (ok == uris.size) "Backed up $ok ${if (ok == 1) "file" else "files"} to Lodge."
                 else "Backed up $ok of ${uris.size} — some were too large or failed."
         }
     }
@@ -1082,7 +1094,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             label = label, enabled = true, watermarkMs = 0L, boundaryKeys = emptySet(),
         ))
         ai.tournesol.privacylodge.backup.BackupSyncWorker.applySchedule(app)
-        backupNotice.value = "“$label” is now kept in sync with your box."
+        backupNotice.value = "“$label” is now kept in sync with Lodge."
         kickSync()
     }
 
@@ -1142,10 +1154,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
         viewModelScope.launch(Dispatchers.IO) {
             configBusy.value = true
-            configNotice.value = "Asking your box for a backup…"
+            configNotice.value = "Asking Lodge for a backup…"
             val id = runCatching { MatrixRepo.sendBoxCommand("backup", passphrase) }.getOrNull()
             if (id == null) {
-                configNotice.value = "Couldn't reach your box."; configBusy.value = false; return@launch
+                configNotice.value = "Couldn't reach Lodge."; configBusy.value = false; return@launch
             }
             var env: String? = null
             for (i in 1..20) {
@@ -1155,7 +1167,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             configBusy.value = false
             if (env == null) {
-                configNotice.value = "Your box didn't return a backup — try again."
+                configNotice.value = "Lodge didn't return a backup — try again."
             } else {
                 backupEnvelope.value = env
                 configNotice.value = "Backup ready — choose where to save it."
@@ -1188,7 +1200,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             configNotice.value = "Checking for updates over Tor…"
             val id = runCatching { MatrixRepo.sendBoxCommand("check_update") }.getOrNull()
             if (id == null) {
-                configNotice.value = "Couldn't reach your box."; updateBusy.value = false; return@launch
+                configNotice.value = "Couldn't reach Lodge."; updateBusy.value = false; return@launch
             }
             var out: MatrixRepo.CommandOutcome? = null
             for (i in 1..30) {
@@ -1198,7 +1210,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             updateBusy.value = false
             configNotice.value = out?.message
-                ?: "Your box didn't answer — it may still be starting."
+                ?: "Lodge didn't answer — it may still be starting."
             loadUpdateInfo()
         }
     }
@@ -1209,12 +1221,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val target = updateInfo.value?.latest.orEmpty()
         viewModelScope.launch(Dispatchers.IO) {
             updateBusy.value = true
-            configNotice.value = "Installing the update — your box will restart…"
+            configNotice.value = "Installing the update — Lodge will restart…"
             val id = runCatching {
                 MatrixRepo.sendBoxCommand("update", targetVersion = target)
             }.getOrNull()
             if (id == null) {
-                configNotice.value = "Couldn't reach your box."; updateBusy.value = false; return@launch
+                configNotice.value = "Couldn't reach Lodge."; updateBusy.value = false; return@launch
             }
             var out: MatrixRepo.CommandOutcome? = null
             // A native install downloads a whole binary over Tor — allow generous time.
@@ -1225,7 +1237,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             updateBusy.value = false
             configNotice.value = out?.message
-                ?: "Still working — your box will come back on its own."
+                ?: "Still working — Lodge will come back on its own."
             loadUpdateInfo()
             loadBoxStatus()
         }
@@ -1233,17 +1245,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Restart the box's services (safe) via the guarded command channel. */
     fun restartBox() {
+        if (configBusy.value) return
+        configBusy.value = true
         viewModelScope.launch(Dispatchers.IO) {
-            configBusy.value = true
             val id = runCatching { MatrixRepo.sendBoxCommand("restart") }.getOrNull()
-            if (id == null) { configNotice.value = "Couldn't reach your box."; configBusy.value = false; return@launch }
-            configNotice.value = "Restarting your box…"
-            repeat(20) {
+            if (id == null) { configNotice.value = "Couldn't reach Lodge."; configBusy.value = false; return@launch }
+            configNotice.value = "Waiting for Lodge to accept the restart…"
+            var outcome: MatrixRepo.CommandOutcome? = null
+            for (attempt in 0 until 20) {
                 kotlinx.coroutines.delay(2000)
-                if (runCatching { MatrixRepo.readCommandResult(id) }.getOrNull() == true) {
-                    configNotice.value = "Your box is restarting."
-                }
+                outcome = MatrixRepo.readCommandOutcome(id)
+                if (outcome != null) break
             }
+            configNotice.value = outcome?.message ?: if (outcome?.ok == true) "Lodge accepted the restart."
+                else if (outcome?.ok == false) "Lodge could not restart."
+                else "No acknowledgement yet. Check Lodge's status before trying again."
             configBusy.value = false
             loadBoxStatus()
         }
@@ -1253,18 +1269,30 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *  typing the box name (see PP Config). After reset the box identity is gone, so we
      *  sign out locally to a fresh state. */
     fun resetBox(typedName: String) {
+        if (configBusy.value) return
         val expected = boxStatus.value?.boxName?.trim().orEmpty()
         if (expected.isEmpty() || typedName.trim() != expected) {
-            configNotice.value = "That doesn't match your box's name."
+            configNotice.value = "That doesn't match Lodge's name."
             return
         }
+        configBusy.value = true
         viewModelScope.launch(Dispatchers.IO) {
-            configBusy.value = true
             val id = runCatching { MatrixRepo.sendBoxCommand("reset") }.getOrNull()
-            if (id == null) { configNotice.value = "Couldn't reach your box."; configBusy.value = false; return@launch }
-            configNotice.value = "Resetting your box…"
-            kotlinx.coroutines.delay(4000)   // let the box ack + begin wiping
-            // The box + its account are being destroyed — sign out locally to a fresh state.
+            if (id == null) { configNotice.value = "Couldn't reach Lodge."; configBusy.value = false; return@launch }
+            configNotice.value = "Waiting for Lodge to accept the reset…"
+            var outcome: MatrixRepo.CommandOutcome? = null
+            for (attempt in 0 until 30) {
+                kotlinx.coroutines.delay(2000)
+                outcome = MatrixRepo.readCommandOutcome(id)
+                if (outcome != null) break
+            }
+            if (outcome?.ok != true) {
+                configNotice.value = outcome?.message
+                    ?: "Reset was not confirmed. Your phone is still signed in. Check the box before trying again."
+                configBusy.value = false
+                return@launch
+            }
+            // Only an explicit acknowledgement for this request permits local sign-out.
             runCatching { PpSyncService.stop(getApplication()) }
             runCatching { MatrixRepo.logout(getApplication()) }
             PasscodeStore.clear(getApplication())
@@ -1409,12 +1437,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Pause / "go dark": tear down sync + Tor and hide the chat list, WITHOUT signing
-     *  out (session + keys stay). Peers' messages queue on your box (your computer) and
+     *  out (session + keys stay). Peers' messages queue on Lodge (your computer) and
      *  arrive on Resume. Persisted so it holds across app restarts. */
     fun pause() {
         isPaused = true; paused.value = true
         val app = getApplication<Application>()
         screen.value = Screen.Paused
+        BackgroundSyncWorker.cancel(app)
+        ai.tournesol.privacylodge.backup.BackupSyncWorker.cancelAll(app)
+        ai.tournesol.privacybolt.net.TorNet.stopAll()
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { MatrixRepo.pauseSync() }   // stop the sync stream, keep the session
             runCatching { PpSyncService.stop(app) }  // drop the foreground service + its notification
@@ -1440,37 +1471,53 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             runCatching { MatrixRepo.startSync() }
             runCatching { PpSyncService.start(app) }
             screen.value = if (MatrixRepo.isLoggedIn) Screen.Rooms else Screen.Login
+            consumePendingContact()
         }
     }
 
     fun logout() {
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { MatrixRepo.logout(getApplication()) }
-            PasscodeStore.clear(getApplication())   // forget the passcode -> re-sign-in re-prompts (feature C)
-            isPaused = false; paused.value = false
-            gate.value = Gate.Open
-            screen.value = Screen.Login
+        gate.value = Gate.Locked
+        messageDrafts.value = emptyMap()
+        messageSending.value = emptySet()
+        viewModelScope.launch(Dispatchers.IO + kotlinx.coroutines.NonCancellable) {
+            try {
+                MatrixRepo.logout(getApplication())
+                PasscodeStore.clear(getApplication())
+                isPaused = false; paused.value = false
+                screen.value = Screen.Login
+                gate.value = Gate.Open
+            } catch (_: Exception) {
+                // A storage failure is not a successful sign-out. Keep content covered;
+                // the user can retry or use Android's full app reset from Settings.
+                gate.value = Gate.Locked
+                lockError.value = "Couldn't finish signing out. Try again, or clear app storage in Android Settings."
+            }
         }
     }
 
-    /** "Erase this phone": everything [logout] wipes (session + crypto store) PLUS the
-     *  Tor data dir (guards / onion-descriptor cache) and app caches — a true local wipe
-     *  that leaves no trace on the device. Your box + chats live on your computer, so a
-     *  fresh sign-in restores them. Destructive; the UI gates it behind a confirm. */
+    /** Full Android app reset, also used by the emergency code and failed-attempt limit.
+     * A successful request closes the app; it is NOT an in-process logout. Android owns
+     * deletion of app data and cancellation of jobs. Exported files and box data remain.
+     * Never report completion from the boolean: it means the request was accepted. */
     fun eraseDevice() {
+        gate.value = Gate.Locked
+        messageDrafts.value = emptyMap()
+        messageSending.value = emptySet()
         val app = getApplication<Application>()
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { PpSyncService.stop(app) }
-            runCatching { MatrixRepo.logout(app) }          // session + crypto store
-            runCatching { TorManager.stop() }
-            runCatching { java.io.File(app.filesDir, "tor").deleteRecursively() }   // guards + descriptor cache
-            runCatching { app.cacheDir.deleteRecursively() }                        // any cached media/thumbs
-            PasscodeStore.clear(app)                        // forget the passcode too (feature C)
-            isPaused = false; paused.value = false
-            gate.value = Gate.Open
-            // Re-boot Tor for the next sign-in (its data dir was just wiped → fresh guards).
-            viewModelScope.launch(Dispatchers.IO) { runCatching { TorManager.start(app) } }
-            screen.value = Screen.Login
+        // Once requested, leaving/destroying the screen must not cancel erasure.
+        viewModelScope.launch(Dispatchers.IO + kotlinx.coroutines.NonCancellable) {
+            val accepted = try {
+                app.getSystemService(android.app.ActivityManager::class.java)
+                    ?.clearApplicationUserData() == true
+            } catch (_: Exception) {
+                false
+            }
+            if (!accepted) {
+                // Keep the account covered and be honest: no destructive fallback that
+                // might only partially erase data, no Login or automatic Tor restart.
+                gate.value = Gate.Locked
+                lockError.value = "Android couldn't reset Privacy Bolt. Clear its storage in Android Settings."
+            }
         }
     }
 
@@ -1481,13 +1528,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun openRoom(id: String, name: String) {
+        cancelCompose()
+        screen.value = Screen.Chat(id, name)
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 MatrixRepo.openRoom(id)
-                screen.value = Screen.Chat(id, name)
             } catch (t: Throwable) {
+                if (t is kotlinx.coroutines.CancellationException) throw t
                 Log.w("AppVM", "openRoom failed", t)
-                error.value = mapError(t)
+                if ((screen.value as? Screen.Chat)?.roomId == id)
+                    notice.value = "Couldn't load the conversation. Your draft is kept."
             }
         }
     }
@@ -1507,19 +1557,42 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Send the composer text — an EDIT if editing, a REPLY if replying, else a new
      *  message. Clears the compose target afterwards. */
-    fun composeSend(text: String) {
-        val t = text.trim(); if (t.isEmpty()) return
+    val messageDrafts = MutableStateFlow<Map<String, String>>(emptyMap())
+    val messageSending = MutableStateFlow<Set<String>>(emptySet())
+    fun setMessageDraft(roomId: String, text: String) {
+        messageDrafts.value = messageDrafts.value.toMutableMap().apply {
+            if (text.isEmpty()) remove(roomId) else put(roomId, text)
+        }
+    }
+
+    fun composeSend(roomId: String, text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty() || roomId in messageSending.value) return
         val edit = editTarget.value; val reply = replyTarget.value
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                when {
-                    edit?.eventId != null -> MatrixRepo.editMessage(edit.eventId, t)
-                    reply?.eventId != null -> MatrixRepo.replyToMessage(reply.eventId, t)
-                    else -> MatrixRepo.send(t)
+        val account = myId
+        messageSending.value = messageSending.value + roomId
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    check(myId == account && MatrixRepo.currentRoomId == roomId) { "Reopen this chat to send." }
+                    when {
+                        edit?.eventId != null -> MatrixRepo.editMessage(edit.eventId, trimmed, roomId)
+                        reply?.eventId != null -> MatrixRepo.replyToMessage(reply.eventId, trimmed, roomId)
+                        else -> MatrixRepo.send(trimmed, roomId)
+                    }
                 }
+                if (myId == account) {
+                    if (messageDrafts.value[roomId] == text) setMessageDraft(roomId, "")
+                    if (editTarget.value == edit) editTarget.value = null
+                    if (replyTarget.value == reply) replyTarget.value = null
+                }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (myId == account) notice.value = "Message not sent. Your draft is kept. Check your connection and try again."
+            } finally {
+                messageSending.value = messageSending.value - roomId
             }
         }
-        replyTarget.value = null; editTarget.value = null
     }
 
     fun deleteMessage(key: String) {

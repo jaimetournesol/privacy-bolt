@@ -46,11 +46,13 @@ class BackupSyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker
     }
 
     override suspend fun doWork(): Result {
+        if (applicationContext.getSharedPreferences("pp_app", Context.MODE_PRIVATE).getBoolean("paused", false)
+            || !BackupSyncStore.hasEnabledSource(applicationContext)) return Result.success()
         PpSyncService.ensureChannels(applicationContext)
         runCatching { setForeground(getForegroundInfo()) }   // long uploads survive backgrounding
         if (!BackupSyncManager.ensureSession(applicationContext)) return Result.retry()
-        return when (BackupSyncManager.runPass(applicationContext)) {
-            is BackupSyncManager.Result.Done -> Result.success()
+        return when (val outcome = BackupSyncManager.runPass(applicationContext)) {
+            is BackupSyncManager.Result.Done -> if (outcome.failed == 0 && outcome.skipped == 0) Result.success() else Result.retry()
             BackupSyncManager.Result.AlreadyRunning -> Result.success()
             BackupSyncManager.Result.NotReady -> Result.retry()
         }
@@ -86,7 +88,7 @@ class BackupSyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker
         fun syncNow(ctx: Context) {
             if (!BackupSyncStore.hasEnabledSource(ctx)) return
             val req = OneTimeWorkRequestBuilder<BackupSyncWorker>()
-                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                .setConstraints(constraints(ctx))
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .build()
             WorkManager.getInstance(ctx).enqueueUniqueWork(ONESHOT, ExistingWorkPolicy.KEEP, req)

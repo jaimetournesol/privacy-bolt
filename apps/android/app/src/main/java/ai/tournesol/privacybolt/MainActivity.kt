@@ -4,6 +4,8 @@ import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.BackHandler
@@ -41,6 +43,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.RestartAlt
@@ -86,6 +90,8 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.runtime.produceState
 import ai.tournesol.privacybolt.matrix.MatrixRepo
 import androidx.lifecycle.DefaultLifecycleObserver
@@ -119,33 +125,32 @@ class MainActivity : ComponentActivity() {
     private val vm: AppViewModel by viewModels()
     private val perms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {}
 
-    /** Ask for everything a call needs (mic + camera) plus notifications, up front —
-     *  without these granted the Element Call WebView's getUserMedia throws
-     *  NotReadableError and the call dies with "Something went wrong". */
+    /** Ask once after login; navigation must not repeatedly prompt after a denial.
+     * Camera and microphone permission belong to the feature that uses them. */
     private fun requestCorePermissions() {
-        val want = mutableListOf(
-            android.Manifest.permission.RECORD_AUDIO,
-            android.Manifest.permission.CAMERA,
-        )
+        val preferences = getSharedPreferences("pp_permissions", MODE_PRIVATE)
+        if (preferences.getBoolean("notifications_requested", false)) return
+        val want = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= 33) want += android.Manifest.permission.POST_NOTIFICATIONS
         val ask = want.filter {
             checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
         }
-        if (ask.isNotEmpty()) perms.launch(ask.toTypedArray())
+        if (ask.isNotEmpty()) {
+            preferences.edit().putBoolean("notifications_requested", true).apply()
+            perms.launch(ask.toTypedArray())
+        }
     }
 
     // Foreground = snappy backstop poll + live previews; background = gentle poll
     // (sliding sync still delivers in real time — this only changes wake cadence).
-    override fun onResume() { super.onResume(); vm.setForeground(true) }
-    override fun onStop() { super.onStop(); vm.setForeground(false) }
 
     // Passcode auto-lock (feature C). Observe the *process* lifecycle, not this Activity's —
     // so launching our OWN sub-activities (the call UI, the QR scanner, image pickers) does
     // NOT count as backgrounding and never locks the user out mid-call. Only the whole app
     // going to background re-locks.
     private val processObserver = object : DefaultLifecycleObserver {
-        override fun onStart(owner: LifecycleOwner) { vm.onEnterForeground() }
-        override fun onStop(owner: LifecycleOwner) { vm.onEnterBackground() }
+        override fun onStart(owner: LifecycleOwner) { vm.setForeground(true); vm.onEnterForeground() }
+        override fun onStop(owner: LifecycleOwner) { vm.setForeground(false); vm.onEnterBackground() }
     }
 
     override fun onDestroy() {
@@ -157,16 +162,15 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // targetSdk 35 (Android 15+) ENFORCES edge-to-edge: content draws behind the system
         // bars and the theme's statusBarColor/navigationBarColor are ignored. Opt in explicitly
-        // with transparent, DARK-style bars (light icons) to match the app's always-dark theme;
+        // with transparent, light-style bars (dark icons) to match Atelier's paper surfaces;
         // each full-screen composable insets its own content with systemBarsPadding().
         enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
-            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            statusBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
         )
         // Keep the login password, identity QR and recovery info out of screenshots
         // and the Recents thumbnail (release builds only — see applyScreenSecurity).
         applyScreenSecurity()
-        requestCorePermissions()   // mic + camera (for calls) + notifications
         handleNotifIntent(intent)
         handleDeepLink(intent)
         ProcessLifecycleOwner.get().lifecycle.addObserver(processObserver)   // auto-lock (feature C)
@@ -192,6 +196,7 @@ class MainActivity : ComponentActivity() {
                         Gate.Locked -> LockScreen(vm)
                         Gate.Open -> {
                             val screen by vm.screen.collectAsState()
+                            LaunchedEffect(screen) { if (MatrixRepo.isLoggedIn) requestCorePermissions() }
                             when (val s = screen) {
                                 is Screen.Splash -> SplashScreen(vm)
                                 is Screen.Login -> LoginScreen(vm)
@@ -199,8 +204,8 @@ class MainActivity : ComponentActivity() {
                                 is Screen.Rooms -> RoomsScreen(vm)
                                 is Screen.Config -> ConfigScreen(vm)
                                 is Screen.Files -> FilesScreen(vm)
-                                is Screen.Agents -> AgentsScreen(vm)
-                                is Screen.AddAgents -> AddAgentsScreen(vm)
+                                is Screen.Agents -> ConductorEntryScreen(vm)
+                                is Screen.AddAgents -> ConductorEntryScreen(vm)
                                 is Screen.Profile -> ProfileScreen(vm)
                                 is Screen.Paused -> PausedScreen(vm)
                                 is Screen.Chat -> ChatScreen(vm, s.roomId, s.roomName)
@@ -289,7 +294,7 @@ private fun TorBadge(modifier: Modifier = Modifier, onRetry: (() -> Unit)? = nul
     ) {
         Icon(Icons.Filled.Lock, null, tint = color, modifier = Modifier.size(14.dp))
         Spacer(Modifier.width(6.dp))
-        Text(label, color = color, fontSize = 12.sp)
+        Text(label, color = color, fontSize = 14.sp)
     }
 
     if (showSheet && onRetry != null) {
@@ -337,7 +342,7 @@ fun SplashScreen(vm: AppViewModel) {
     ) {
         SunflowerMark(size = 88)
         Spacer(Modifier.height(20.dp))
-        Text("Privacy Bolt", color = Paper, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        Text("Privacy Bolt", color = Paper, fontSize = 28.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Serif)
         Spacer(Modifier.height(40.dp))
         CircularProgressIndicator(Modifier.size(28.dp), color = Sunflower, strokeWidth = 3.dp)
         Spacer(Modifier.height(16.dp))
@@ -349,7 +354,7 @@ fun SplashScreen(vm: AppViewModel) {
         if (slow) {
             Spacer(Modifier.height(28.dp))
             Text(
-                "Still connecting over Tor — this is the slow part.\nPrivate, and a little slower; that's the deal.",
+                "The Tor connection is taking longer than usual. Your saved account is still here. Retry the connection or keep waiting.",
                 color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center, lineHeight = 18.sp
             )
             Spacer(Modifier.height(18.dp))
@@ -414,14 +419,14 @@ fun LoginScreen(vm: AppViewModel) {
         Spacer(Modifier.height(48.dp))
         SunflowerMark()
         Spacer(Modifier.height(16.dp))
-        Text("Privacy Bolt", color = Paper, fontSize = 30.sp, fontWeight = FontWeight.Bold)
-        Text("Private, and a little slower — that's the deal.",
+        Text("Privacy Bolt", color = Paper, fontSize = 30.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Serif)
+        Text("Your people, files and workspace. On your own box.",
             color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center)
         Spacer(Modifier.height(8.dp))
         TorBadge(onRetry = vm::retryTor)
         Spacer(Modifier.height(28.dp))
 
-        // Primary affordance: put your box in your pocket by scanning the code the
+        // Primary affordance: put Lodge in your pocket by scanning the code the
         // desktop app shows under "Connect your phone" — no 56-char onion to type.
         Button(
             onClick = { scan.launch(scanOptions()) },
@@ -436,8 +441,8 @@ fun LoginScreen(vm: AppViewModel) {
         Spacer(Modifier.height(14.dp))
         // Orientation for newcomers: the box lives on their computer.
         Text(
-            "New here? Your box lives on your computer — set it up in the Privacy Bolt desktop app, then sign in here.",
-            color = PaperDim, fontSize = 12.sp, textAlign = TextAlign.Center, lineHeight = 17.sp
+            "Set up Privacy Lodge on your computer, then scan its setup code to connect this phone.",
+            color = PaperDim, fontSize = 14.sp, textAlign = TextAlign.Center, lineHeight = 20.sp
         )
 
         if (!manual) {
@@ -447,7 +452,7 @@ fun LoginScreen(vm: AppViewModel) {
             }
         } else {
             Spacer(Modifier.height(24.dp))
-            PpField(onion, { onion = it }, "Your box (.onion)")
+            PpField(onion, { onion = it }, "Lodge (.onion)")
             Spacer(Modifier.height(12.dp))
             PpField(user, { user = it }, "Username")
             Spacer(Modifier.height(12.dp))
@@ -456,7 +461,7 @@ fun LoginScreen(vm: AppViewModel) {
 
             Button(
                 onClick = { vm.clearNotice(); vm.login(onion, user, pass) },
-                enabled = !busy && onion.isNotBlank() && user.isNotBlank(),
+                enabled = !busy && onion.isNotBlank() && user.isNotBlank() && pass.isNotBlank(),
                 colors = ButtonDefaults.buttonColors(containerColor = Sunflower, contentColor = Ink),
                 modifier = Modifier.fillMaxWidth().height(52.dp),
                 shape = RoundedCornerShape(14.dp)
@@ -562,7 +567,7 @@ private fun IdentityChip(
         Text(
             shown,
             color = if (enabled) PaperDim else PaperDim.copy(alpha = 0.5f),
-            fontSize = 12.sp, fontFamily = FontFamily.Monospace,
+            fontSize = 14.sp, fontFamily = FontFamily.Monospace,
             maxLines = if (wrap) Int.MAX_VALUE else 1,
             overflow = if (wrap) TextOverflow.Clip else TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f)
@@ -628,7 +633,11 @@ fun RoomsScreen(vm: AppViewModel) {
     // you started (you scanned them; they haven't scanned back yet). The outgoing one
     // is a persistent, labelled "Pending" row now — not a snackbar that vanishes,
     // leaving the user on an empty "No chats yet" wondering if anything happened.
-    val rooms = allRooms.filter { it.paired || it.invited || it.outgoing }
+    var query by remember { mutableStateOf("") }
+    var requests by remember { mutableStateOf(false) }
+    val requestCount = allRooms.count { !it.paired && (it.invited || it.outgoing) }
+    val rooms = allRooms.filter { if (requests) !it.paired && (it.invited || it.outgoing) else it.paired }
+        .filter { query.isBlank() || it.name.contains(query, ignoreCase = true) || it.peerId?.contains(query, ignoreCase = true) == true }
     val busy by vm.busy.collectAsState()
     val err by vm.error.collectAsState()
     val notice by vm.notice.collectAsState()
@@ -640,7 +649,6 @@ fun RoomsScreen(vm: AppViewModel) {
     // "left" event (default OFF = silent: they become unreachable, not invisible).
     var pendingRemove: RoomSummary? by remember { mutableStateOf(null) }
     var notify by remember { mutableStateOf(false) }
-    BackHandler { (ctx as? android.app.Activity)?.moveTaskToBack(true) }
 
     val scan = rememberScan { contents -> if (contents != null) vm.addContact(contents) }
     val snackbar = remember { SnackbarHostState() }
@@ -684,7 +692,7 @@ fun RoomsScreen(vm: AppViewModel) {
                             focusedTextColor = Paper, unfocusedTextColor = Paper, cursorColor = Sunflower
                         )
                     )
-                    if (err != null) { Spacer(Modifier.height(8.dp)); Text(err!!, color = Danger, fontSize = 12.sp) }
+                    if (err != null) { Spacer(Modifier.height(8.dp)); Text(err!!, color = Danger, fontSize = 14.sp) }
                 }
             },
             confirmButton = {
@@ -730,7 +738,7 @@ fun RoomsScreen(vm: AppViewModel) {
                         else
                             "Silent: they won't be told. They'll just find you " +
                                 "unreachable — their box keeps failing to reach yours.",
-                        color = PaperDim, fontSize = 12.sp,
+                        color = PaperDim, fontSize = 14.sp,
                         modifier = Modifier.padding(start = 4.dp)
                     )
                 }
@@ -754,6 +762,7 @@ fun RoomsScreen(vm: AppViewModel) {
 
     Scaffold(
         containerColor = Ink,
+        bottomBar = { AppNavigation(vm, "Messages") },
         snackbarHost = { SnackbarHost(snackbar) },
         floatingActionButton = {
             FloatingActionButton(onClick = { vm.clearError(); showSheet = true },
@@ -763,7 +772,7 @@ fun RoomsScreen(vm: AppViewModel) {
         },
         topBar = {
             TopAppBar(
-                title = { Column { Text("Chats", color = Paper, fontWeight = FontWeight.Bold); TorBadge(onRetry = vm::retryTor) } },
+                title = { Column { Text("Messages", color = Paper, fontWeight = FontWeight.Bold); TorBadge(onRetry = vm::retryTor) } },
                 navigationIcon = {
                     IconButton(onClick = { vm.goHome() }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "back to apps", tint = Sunflower)
@@ -778,17 +787,27 @@ fun RoomsScreen(vm: AppViewModel) {
             )
         }
     ) { pad ->
+        Column(Modifier.fillMaxSize().padding(pad)) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            FilterChip(selected = !requests, onClick = { requests = false }, label = { Text("Chats") })
+            FilterChip(selected = requests, onClick = { requests = true }, label = { Text("Requests ($requestCount)") })
+        }
+        OutlinedTextField(value = query, onValueChange = { query = it }, singleLine = true,
+            placeholder = { Text("Find a contact") }, leadingIcon = { Icon(Icons.Filled.Search, null) },
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), shape = RoundedCornerShape(18.dp))
+        if (err != null) Text(err!!, color = Danger, modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
+        if (busy) LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Sunflower)
         if (rooms.isEmpty()) {
             Column(
-                Modifier.fillMaxSize().padding(pad).padding(32.dp),
+                Modifier.fillMaxSize().padding(28.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
                 Icon(Icons.Filled.QrCodeScanner, null, tint = Sunflower, modifier = Modifier.size(48.dp))
                 Spacer(Modifier.height(16.dp))
-                Text("No chats yet", color = Paper, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                Text(if (query.isNotBlank()) "No matching contacts" else if (requests) "No pending requests" else "Your conversations start here", color = Paper, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(6.dp))
-                Text("Scan a friend's code, or show yours — that's all it takes to connect across boxes, over Tor.",
+                Text(if (query.isNotBlank()) "Try a different name or address." else "You both scan each other’s code to connect. Requests stay here until both people agree.",
                     color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center)
                 Spacer(Modifier.height(20.dp))
                 Button(onClick = { scan.launch(scanOptions()) },
@@ -800,7 +819,7 @@ fun RoomsScreen(vm: AppViewModel) {
                 TextButton(onClick = { vm.showProfile() }) { Text("Show my code", color = Sunflower) }
             }
         } else {
-            LazyColumn(Modifier.fillMaxSize().padding(pad)) {
+            LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 88.dp)) {
                 items(rooms, key = { it.id }) { r ->
                     RoomRow(
                         r,
@@ -809,6 +828,7 @@ fun RoomsScreen(vm: AppViewModel) {
                         // "Scan their code…" button (onScan) instead.
                         onOpen = { vm.openRoom(r.id, r.name) },
                         onScan = { scan.launch(scanOptions()) },
+                        onShowCode = { vm.showProfile() },
                         // Long-press → Remove → confirm dialog (built below).
                         onRemove = { pendingRemove = r },
                     )
@@ -816,6 +836,7 @@ fun RoomsScreen(vm: AppViewModel) {
             }
         }
     }
+}
 }
 
 @Composable
@@ -830,7 +851,7 @@ private fun SheetAction(icon: androidx.compose.ui.graphics.vector.ImageVector, t
         Spacer(Modifier.width(16.dp))
         Column {
             Text(title, color = Paper, fontSize = 16.sp, fontWeight = FontWeight.Medium)
-            Text(subtitle, color = PaperDim, fontSize = 12.sp)
+            Text(subtitle, color = PaperDim, fontSize = 14.sp)
         }
     }
 }
@@ -850,7 +871,7 @@ private fun relativeTime(ts: Long): String {
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun RoomRow(r: RoomSummary, onOpen: () -> Unit, onScan: () -> Unit, onRemove: () -> Unit) {
+private fun RoomRow(r: RoomSummary, onOpen: () -> Unit, onScan: () -> Unit, onShowCode: () -> Unit, onRemove: () -> Unit) {
     val pending = !r.paired   // invited (incoming) or outgoing (waiting)
     var menuOpen by remember { mutableStateOf(false) }
     Column(
@@ -890,20 +911,20 @@ private fun RoomRow(r: RoomSummary, onOpen: () -> Unit, onScan: () -> Unit, onRe
                     // A live chat shows when it last had activity, right-aligned.
                     if (!pending && r.ts > 0L) {
                         Spacer(Modifier.width(8.dp))
-                        Text(relativeTime(r.ts), color = PaperDim, fontSize = 11.sp, maxLines = 1)
+                        Text(relativeTime(r.ts), color = PaperDim, fontSize = 13.sp, maxLines = 1)
                     }
                 }
                 // Mutual-consent states: incoming request (they scanned you), outgoing
                 // (you scanned them, waiting). A live chat shows its last message preview.
                 when {
-                    r.invited -> Text("Wants to connect", color = Sunflower, fontSize = 12.sp)
+                    r.invited -> Text("Wants to connect", color = Sunflower, fontSize = 14.sp)
                     // "outgoing" = I've scanned them and joined; we're waiting on the
                     // other box. That's EITHER they haven't scanned me back yet OR their
                     // box is still reachable-over-Tor catching up (a first-time pair can
                     // take a minute). Say so honestly instead of the misleading (and
                     // re-scan-inducing) "waiting for them to scan your code".
-                    r.outgoing -> Text("Connecting over Tor — can take a minute · they may need to scan you too",
-                        color = PaperDim, fontSize = 12.sp)
+                    r.outgoing -> Text("Request sent · waiting for your contact and their box",
+                        color = PaperDim, fontSize = 14.sp)
                     r.preview != null -> Text(r.preview!!, color = PaperDim, fontSize = 13.sp,
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
@@ -920,7 +941,7 @@ private fun RoomRow(r: RoomSummary, onOpen: () -> Unit, onScan: () -> Unit, onRe
             }
             Spacer(Modifier.height(10.dp))
             OutlinedButton(
-                onClick = onScan,
+                onClick = if (r.invited) onScan else onShowCode,
                 modifier = Modifier.fillMaxWidth().height(44.dp),
                 shape = RoundedCornerShape(12.dp),
                 border = androidx.compose.foundation.BorderStroke(1.dp, Sunflower),
@@ -929,9 +950,12 @@ private fun RoomRow(r: RoomSummary, onOpen: () -> Unit, onScan: () -> Unit, onRe
                 Icon(Icons.Filled.QrCodeScanner, null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    if (r.invited) "Scan their code to connect" else "Scan their code to finish",
+                    if (r.invited) "Scan their code to connect" else "Show my code",
                     fontSize = 13.sp, fontWeight = FontWeight.SemiBold
                 )
+            }
+            if (r.peerId != null) TextButton(onClick = onRemove, modifier = Modifier.fillMaxWidth()) {
+                Text(if (r.invited) "Decline request" else "Cancel request", color = PaperDim)
             }
         }
     }
@@ -941,7 +965,10 @@ private fun RoomRow(r: RoomSummary, onOpen: () -> Unit, onScan: () -> Unit, onRe
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileScreen(vm: AppViewModel) {
-    BackHandler { vm.openRooms() }
+    BackHandler { vm.closeProfile() }
+    var privacyTab by rememberSaveable { mutableStateOf(false) }
+    val savedName by vm.displayName.collectAsState()
+    var nameDraft by remember(savedName) { mutableStateOf(savedName) }
     val id = vm.myId
     val name = id.removePrefix("@").substringBefore(":")
     // Encode the QR as a "privacy-bolt:@name:onion" deep link: ANY camera/QR scanner
@@ -965,6 +992,7 @@ fun ProfileScreen(vm: AppViewModel) {
     // Sign-out sheet — two levels: a plain sign-out vs a destructive full device wipe.
     // Cancel is the safe default (confirm slot); Erase is a distinct destructive action.
     var showSignOut by remember { mutableStateOf(false) }
+    var showErase by remember { mutableStateOf(false) }
     if (showSignOut) {
         AlertDialog(
             onDismissRequest = { showSignOut = false },
@@ -972,9 +1000,9 @@ fun ProfileScreen(vm: AppViewModel) {
             icon = { Icon(Icons.AutoMirrored.Filled.Logout, null, tint = Sunflower) },
             title = { Text("Sign out?", color = Paper, fontWeight = FontWeight.Bold) },
             text = {
-                Column {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
                     Text(
-                        "Your box and your chats live on your computer — signing back in restores them.",
+                        "Lodge stays online. Signing out removes this app’s local account, keys and backup settings. Signing back in can recover history from Lodge.",
                         color = PaperDim, fontSize = 13.sp, lineHeight = 18.sp
                     )
                     Spacer(Modifier.height(16.dp))
@@ -986,14 +1014,14 @@ fun ProfileScreen(vm: AppViewModel) {
                         Text("Sign out", color = Sunflower, fontWeight = FontWeight.SemiBold)
                     }
                     TextButton(
-                        onClick = { showSignOut = false; vm.eraseDevice() },
+                        onClick = { showSignOut = false; showErase = true },
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Icon(Icons.Filled.DeleteForever, null, tint = Danger); Spacer(Modifier.width(8.dp))
-                        Text("Erase this phone", color = Danger, fontWeight = FontWeight.SemiBold)
+                        Text("Erase app data", color = Danger, fontWeight = FontWeight.SemiBold)
                     }
-                    Text("Erase also wipes Tor data + caches — nothing left on this device.",
-                        color = PaperDim, fontSize = 11.sp, lineHeight = 15.sp)
+                    Text("For a full reset of Privacy Bolt on this phone, choose Erase app data.",
+                        color = PaperDim, fontSize = 13.sp, lineHeight = 20.sp)
                 }
             },
             confirmButton = {
@@ -1002,20 +1030,48 @@ fun ProfileScreen(vm: AppViewModel) {
         )
     }
 
+    if (showErase) {
+        AlertDialog(
+            onDismissRequest = { showErase = false },
+            containerColor = InkCard,
+            icon = { Icon(Icons.Filled.DeleteForever, null, tint = Danger) },
+            title = { Text("Erase Privacy Bolt data?", color = Paper) },
+            text = {
+                Text(
+                    "Android will reset all Privacy Bolt data, codes and permissions on this phone and close the app. " +
+                        "Reopen it to sign in. Lodge stays online and files saved outside the app are kept.",
+                    color = PaperDim
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showErase = false; vm.eraseDevice() }) {
+                    Text("Erase and close", color = Danger)
+                }
+            },
+            dismissButton = { TextButton(onClick = { showErase = false }) { Text("Cancel", color = PaperDim) } }
+        )
+    }
+
     Scaffold(
         containerColor = Ink,
         topBar = {
             TopAppBar(
-                navigationIcon = { IconButton(onClick = { vm.openRooms() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Paper) } },
+                navigationIcon = { IconButton(onClick = { vm.closeProfile() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Paper) } },
                 title = { Text("Profile", color = Paper, fontWeight = FontWeight.Bold) },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft)
             )
         }
     ) { pad ->
+        Column(Modifier.fillMaxSize().padding(pad)) {
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(selected = !privacyTab, onClick = { privacyTab = false }, label = { Text("Your code") })
+            FilterChip(selected = privacyTab, onClick = { privacyTab = true }, label = { Text("Profile & privacy") })
+        }
         Column(
-            Modifier.fillMaxSize().padding(pad).padding(28.dp).verticalScroll(rememberScrollState()),
+            Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            if (!privacyTab) {
             Spacer(Modifier.height(8.dp))
             // Tappable avatar → pick an image → upload. A small camera badge signals it's
             // editable; a contact's-eye-view of what your paired peers will see.
@@ -1049,15 +1105,15 @@ fun ProfileScreen(vm: AppViewModel) {
                     // never a broken QR encoding a blank address.
                     Box(Modifier.size(240.dp), contentAlignment = Alignment.Center) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            CircularProgressIndicator(color = Ink)
+                            CircularProgressIndicator(color = Sunflower)
                             Spacer(Modifier.height(12.dp))
-                            Text("Preparing your code…", color = Ink, fontSize = 12.sp)
+                            Text("Preparing your code…", color = Paper, fontSize = 14.sp)
                         }
                     }
                 }
             }
             Spacer(Modifier.height(16.dp))
-            Text("Have a friend scan this to message you", color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center)
+            Text("Both of you scan each other’s code to connect", color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center)
             Spacer(Modifier.height(12.dp))
 
             // The raw address, copyable as a fallback to QR. Un-clipped: a friend can read
@@ -1073,7 +1129,7 @@ fun ProfileScreen(vm: AppViewModel) {
             Button(
                 onClick = { scan.launch(scanOptions()) },
                 colors = ButtonDefaults.buttonColors(containerColor = Sunflower, contentColor = Ink),
-                modifier = Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(14.dp)
+                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp), shape = RoundedCornerShape(14.dp)
             ) {
                 Icon(Icons.Filled.QrCodeScanner, null); Spacer(Modifier.width(8.dp))
                 Text("Scan a friend's code", fontWeight = FontWeight.SemiBold)
@@ -1082,24 +1138,23 @@ fun ProfileScreen(vm: AppViewModel) {
             val err by vm.error.collectAsState()
             if (busy) { Spacer(Modifier.height(14.dp)); CircularProgressIndicator(color = Sunflower) }
             if (err != null) { Spacer(Modifier.height(12.dp)); Text(err!!, color = Danger, fontSize = 13.sp, textAlign = TextAlign.Center) }
-
-            Spacer(Modifier.height(36.dp))
+            } else {
+            Text("Your profile & privacy", color = Paper, fontSize = 22.sp, fontWeight = FontWeight.Bold,
+                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp))
             Text(
-                "🔒 No telemetry, no analytics, no trackers.\nNothing leaves your phone but your messages — end-to-end encrypted, over Tor, to your own box.",
-                color = PaperDim, fontSize = 12.sp, textAlign = TextAlign.Center,
-                lineHeight = 17.sp
+                "Messages and files travel encrypted over Tor. Lodge stores recovery material so a new phone can recover your history: protect and trust the machine running it. Agents send the content you give them to OpenAI through your Codex account.",
+                color = PaperDim, fontSize = 14.sp, textAlign = TextAlign.Center,
+                lineHeight = 20.sp
             )
 
             // ── Your name ───────────────────────────────────────────────────────
             Spacer(Modifier.height(28.dp))
             HorizontalDivider(color = InkCard)
             Spacer(Modifier.height(16.dp))
-            val savedName by vm.displayName.collectAsState()
-            var nameDraft by remember(savedName) { mutableStateOf(savedName) }
             Column(Modifier.fillMaxWidth()) {
                 Text("Your display name", color = Paper, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
-                Text("Paired contacts see this above your messages instead of your onion address. Leave blank to stay anonymous.",
-                    color = PaperDim, fontSize = 12.sp, lineHeight = 16.sp)
+                Text("Paired contacts see this name above your messages. Your account address is still visible to them.",
+                    color = PaperDim, fontSize = 14.sp, lineHeight = 20.sp)
                 Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     OutlinedTextField(
@@ -1130,7 +1185,7 @@ fun ProfileScreen(vm: AppViewModel) {
                 Column(Modifier.weight(1f).padding(end = 12.dp)) {
                     Text("Send read receipts", color = Paper, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
                     Text("Let contacts see when you've read their messages — and see when they've read yours. Off keeps your reading private.",
-                        color = PaperDim, fontSize = 12.sp, lineHeight = 16.sp)
+                        color = PaperDim, fontSize = 14.sp, lineHeight = 20.sp)
                 }
                 Switch(
                     checked = receipts, onCheckedChange = { vm.setReadReceipts(it) },
@@ -1147,7 +1202,7 @@ fun ProfileScreen(vm: AppViewModel) {
             // Pause / go dark: tear down Tor + sync, hide the chats, appear offline.
             OutlinedButton(
                 onClick = { vm.pause() },
-                modifier = Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp), shape = RoundedCornerShape(14.dp),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Paper),
                 border = androidx.compose.foundation.BorderStroke(1.dp, InkCard)
             ) {
@@ -1155,8 +1210,8 @@ fun ProfileScreen(vm: AppViewModel) {
                 Text("Pause — go offline", fontWeight = FontWeight.SemiBold)
             }
             Spacer(Modifier.height(6.dp))
-            Text("Stops Tor and hides your chats. Messages wait on your box until you resume.",
-                color = PaperDim, fontSize = 12.sp, textAlign = TextAlign.Center, lineHeight = 16.sp)
+            Text("Stops Tor and hides your chats. Messages wait on Lodge until you resume.",
+                color = PaperDim, fontSize = 14.sp, textAlign = TextAlign.Center, lineHeight = 20.sp)
 
             Spacer(Modifier.height(16.dp))
             TextButton(onClick = { showSignOut = true }, modifier = Modifier.fillMaxWidth()) {
@@ -1164,6 +1219,8 @@ fun ProfileScreen(vm: AppViewModel) {
                 Text("Sign out", color = Danger, fontWeight = FontWeight.SemiBold)
             }
             Spacer(Modifier.height(24.dp))
+            }
+        }
         }
     }
 }
@@ -1183,7 +1240,7 @@ fun PausedScreen(vm: AppViewModel) {
             Text("Paused — you're offline", color = Paper, fontSize = 20.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(10.dp))
             Text(
-                "No messages go in or out, and Tor is off. Your box holds anything sent to you until you resume.",
+                "No messages go in or out, and Tor is off. Lodge holds anything sent to you until you resume.",
                 color = PaperDim, fontSize = 14.sp, textAlign = TextAlign.Center, lineHeight = 20.sp
             )
             Spacer(Modifier.height(28.dp))
@@ -1204,14 +1261,26 @@ fun PausedScreen(vm: AppViewModel) {
 fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
     BackHandler { vm.back() }
     val ctx = LocalContext.current
-    val messages by vm.messages.collectAsState()
+    val chat by vm.chatTimeline.collectAsState()
+    val messages = if (chat.roomId == roomId) chat.messages else emptyList()
+    val loading = chat.roomId != roomId || chat.loading
+    val chatReady = chat.roomId == roomId && chat.ready
     val notice by vm.notice.collectAsState()
     val replyTarget by vm.replyTarget.collectAsState()
     val editTarget by vm.editTarget.collectAsState()
-    var draft by remember { mutableStateOf("") }
+    val drafts by vm.messageDrafts.collectAsState()
+    val sending by vm.messageSending.collectAsState()
+    val draft = drafts[roomId].orEmpty()
+    fun setDraft(value: String) { vm.setMessageDraft(roomId, value) }
     val listState = rememberLazyListState()
     val snackbar = remember { SnackbarHostState() }
-    LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1) }
+    var previousSize by remember(roomId) { mutableStateOf(0) }
+    LaunchedEffect(messages.size) {
+        val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+        if (messages.isNotEmpty() && (previousSize == 0 || lastVisible >= previousSize - 2))
+            listState.animateScrollToItem(messages.size - 1)
+        previousSize = messages.size
+    }
     LaunchedEffect(notice) { notice?.let { snackbar.showSnackbar(it); vm.clearNotice() } }
     val pickFile = rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.GetContent()
@@ -1234,7 +1303,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
         topBar = {
             TopAppBar(
                 navigationIcon = {
-                    IconButton(onClick = { vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = Paper) }
+                    IconButton(onClick = { vm.back() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Paper) }
                 },
                 title = { Column { Text(roomName, color = Paper, fontWeight = FontWeight.Bold, maxLines = 1); TorBadge(onRetry = vm::retryTor) } },
                 actions = {
@@ -1242,16 +1311,17 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                     IconButton(onClick = {
                         ctx.startActivity(android.content.Intent(ctx, ElementCallActivity::class.java)
                             .putExtra(ElementCallActivity.EXTRA_AUDIO_ONLY, true))
-                    }) { Icon(Icons.Filled.Call, "audio call", tint = Sunflower) }
+                    }, enabled = chatReady) { Icon(Icons.Filled.Call, "audio call", tint = Sunflower) }
                     // Video call (camera icon).
                     IconButton(onClick = {
                         ctx.startActivity(android.content.Intent(ctx, ElementCallActivity::class.java))
-                    }) { Icon(Icons.Filled.Videocam, "video call", tint = Sunflower) }
+                    }, enabled = chatReady) { Icon(Icons.Filled.Videocam, "video call", tint = Sunflower) }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft)
             )
         },
         bottomBar = {
+          if (chatReady) {
           // Edge-to-edge (targetSdk 35): the window draws behind the keyboard AND the nav bar,
           // and a Scaffold does NOT inset a custom bottomBar for us. Pad by max(ime, navBar) so
           // the composer rides above the keyboard when open and sits above the nav bar/home
@@ -1270,8 +1340,8 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                         val who = if (r.mine) "yourself" else r.senderName.ifBlank { r.sender.removePrefix("@").substringBefore(":") }
                         "Replying to $who· ${r.body.take(40)}"
                     }
-                    Text(label, color = PaperDim, fontSize = 12.sp, maxLines = 1, modifier = Modifier.weight(1f))
-                    IconButton(onClick = { vm.cancelCompose(); draft = "" }) {
+                    Text(label, color = PaperDim, fontSize = 14.sp, maxLines = 1, modifier = Modifier.weight(1f))
+                    IconButton(onClick = { vm.cancelCompose(); setDraft("") }) {
                         Icon(Icons.Filled.Close, "cancel", tint = PaperDim, modifier = Modifier.size(18.dp))
                     }
                 }
@@ -1290,7 +1360,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                     val s = recordElapsed / 1000
                     Text("Recording  %d:%02d".format(s / 60, s % 60), color = Paper, fontSize = 15.sp,
                         modifier = Modifier.weight(1f))
-                    Text("🗑 discard · ✓ send", color = PaperDim, fontSize = 10.sp)
+                    Text("Voice note", color = PaperDim, fontSize = 14.sp)
                     Spacer(Modifier.width(8.dp))
                     FilledIconButton(
                         onClick = { vm.stopAndSendRecording() },
@@ -1306,14 +1376,15 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                     Icon(Icons.Filled.AttachFile, "attach a file", tint = Sunflower)
                 }
                 // [QW-ui] A trimmed draft is the real payload; blank/whitespace never sends.
-                val canSend = draft.isNotBlank()
+                val canSend = draft.isNotBlank() && roomId !in sending
                 val doSend = {
-                    if (canSend) { vm.composeSend(draft); draft = "" }
+                    if (canSend) { vm.composeSend(roomId, draft) }
                 }
                 OutlinedTextField(
-                    value = draft, onValueChange = { draft = it },
+                    value = draft, onValueChange = { setDraft(it) },
                     placeholder = { Text("Message", color = PaperDim) },
                     modifier = Modifier.weight(1f),
+                    maxLines = 5,
                     shape = RoundedCornerShape(22.dp),
                     // [QW-ui] IME "Send" action submits the message from the keyboard.
                     keyboardOptions = KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Send),
@@ -1326,7 +1397,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                 Spacer(Modifier.width(8.dp))
                 // Empty draft → a mic button (record a voice note); typing → the send button.
                 // WhatsApp-style swap keeps one primary action in the same spot.
-                if (canSend || !vm.canRecordVoice()) {
+                if (draft.isNotBlank() || !vm.canRecordVoice()) {
                     FilledIconButton(
                         onClick = doSend,
                         enabled = canSend,
@@ -1341,6 +1412,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
             }
             }
           }   // close the composer Column (reply/edit banner + input row)
+          }
         }
     ) { pad ->
         if (messages.isEmpty()) {
@@ -1349,7 +1421,20 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                     Icon(Icons.Filled.Lock, null, tint = Sunflower, modifier = Modifier.size(36.dp))
                     Spacer(Modifier.height(10.dp))
                     Text("End-to-end encrypted, over Tor", color = PaperDim, fontSize = 13.sp)
-                    Text("Say hi 👋", color = PaperDim, fontSize = 13.sp)
+                    Spacer(Modifier.height(12.dp))
+                    when {
+                        loading -> {
+                            CircularProgressIndicator(Modifier.size(24.dp), color = Sunflower, strokeWidth = 2.dp)
+                            Spacer(Modifier.height(8.dp))
+                            Text("Loading your conversation…", color = PaperDim, fontSize = 13.sp)
+                        }
+                        chat.error != null -> {
+                            Text(chat.error.orEmpty(), color = PaperDim, fontSize = 13.sp,
+                                textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 24.dp))
+                            TextButton(onClick = { vm.openRoom(roomId, roomName) }) { Text("Retry") }
+                        }
+                        else -> Text("Your messages will appear here", color = PaperDim, fontSize = 13.sp)
+                    }
                 }
             }
         } else {
@@ -1367,7 +1452,7 @@ fun ChatScreen(vm: AppViewModel, roomId: String, roomName: String) {
                     Bubble(m, onAttachment = { vm.saveAttachment(m) }, onRetry = { vm.retrySend(m.key) },
                         onCallBack = { ctx.startActivity(android.content.Intent(ctx, ElementCallActivity::class.java)) },
                         onReply = { vm.startReply(m) },
-                        onEdit = { vm.startEdit(m); draft = m.body },
+                        onEdit = { vm.startEdit(m); setDraft(m.body) },
                         onDelete = { m.eventId?.let { vm.deleteMessage(it) } },
                         onReact = { e -> m.eventId?.let { vm.toggleReaction(it, e) } },
                         isPlaying = playingVoice == m.key,
@@ -1416,7 +1501,7 @@ private fun Bubble(
         ) {
             Icon(icon, null, tint = tint, modifier = Modifier.size(15.dp))
             Spacer(Modifier.width(6.dp))
-            Text("${m.body} · tap to call back", color = tint, fontSize = 12.sp)
+            Text("${m.body} · tap to call back", color = tint, fontSize = 14.sp)
         }
         return
     }
@@ -1426,7 +1511,7 @@ private fun Bubble(
     var menuOpen by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(vertical = 5.dp), horizontalAlignment = align) {
         if (!m.mine) Text(m.senderName.ifBlank { m.sender.removePrefix("@").substringBefore(":") },
-            color = Sunflower, fontSize = 11.sp,
+            color = Sunflower, fontSize = 13.sp,
             modifier = Modifier.padding(start = 8.dp, bottom = 2.dp))
       Box {   // anchor for the long-press action menu
         Box(
@@ -1465,7 +1550,7 @@ private fun Bubble(
                         }
                     }
                     Spacer(Modifier.width(10.dp))
-                    Icon(Icons.Filled.GraphicEq, null, tint = if (m.mine) Ink.copy(alpha = 0.7f) else PaperDim,
+                    Icon(Icons.Filled.GraphicEq, null, tint = PaperDim,
                         modifier = Modifier.size(22.dp))
                     Spacer(Modifier.width(10.dp))
                     val secs = (m.voiceMs / 1000).toInt()
@@ -1475,7 +1560,7 @@ private fun Bubble(
                             secs > 0 -> "%d:%02d".format(secs / 60, secs % 60)
                             else -> "Voice"
                         },
-                        color = if (m.mine) Ink else Paper, fontSize = 13.sp)
+                        color = Paper, fontSize = 13.sp)
                 }
             } else if (m.isImage && m.media != null) {
                 // Inline thumbnail: fetch the image bytes over Tor (cached by key) and
@@ -1495,18 +1580,18 @@ private fun Bubble(
                     Column {
                         Image(img, m.fileName ?: "image", contentScale = ContentScale.Fit,
                             modifier = Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(12.dp)))
-                        Text("Tap to save", color = PaperDim, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+                        Text("Tap to save", color = PaperDim, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
                     }
                 } else {
                     Column {
                         Text(m.body, color = Paper, fontSize = 15.sp)
-                        Text("Loading over Tor…", color = PaperDim, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
+                        Text("Loading over Tor…", color = PaperDim, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp))
                     }
                 }
             } else if (isAttachment) {
                 Column {
                     Text(m.body, color = Paper, fontSize = 15.sp)
-                    Text("Tap to save", color = PaperDim, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
+                    Text("Tap to save", color = PaperDim, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp))
                 }
             } else {
                 Text(m.body, color = Paper, fontSize = 15.sp)
@@ -1541,8 +1626,8 @@ private fun Bubble(
                             .clickable { onReact(r.emoji) }.padding(horizontal = 7.dp, vertical = 2.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(r.emoji, fontSize = 12.sp)
-                        if (r.count > 1) { Spacer(Modifier.width(3.dp)); Text("${r.count}", color = if (r.mine) Sunflower else PaperDim, fontSize = 11.sp) }
+                        Text(r.emoji, fontSize = 14.sp)
+                        if (r.count > 1) { Spacer(Modifier.width(3.dp)); Text("${r.count}", color = if (r.mine) Sunflower else PaperDim, fontSize = 13.sp) }
                     }
                 }
             }
@@ -1560,7 +1645,7 @@ private fun Bubble(
                 remember(m.ts) {
                     java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(m.ts))
                 },
-                color = PaperDim, fontSize = 10.sp
+                color = PaperDim, fontSize = 14.sp
             )
             if (m.mine) {
                 Spacer(Modifier.width(6.dp))
@@ -1568,20 +1653,20 @@ private fun Bubble(
                     SendState.Sending -> {
                         Icon(Icons.Filled.Schedule, "sending", tint = PaperDim, modifier = Modifier.size(11.dp))
                         Spacer(Modifier.width(3.dp))
-                        Text("sending…", color = PaperDim, fontSize = 10.sp)
+                        Text("sending…", color = PaperDim, fontSize = 14.sp)
                     }
                     SendState.Sent ->
                         // A double-check "Read" (only when both sides opted in to receipts)
                         // else a single ✓ for "delivered to the server / federated".
                         if (m.readByPeer) {
                             Icon(Icons.Filled.DoneAll, "read", tint = Sunflower, modifier = Modifier.size(13.dp))
-                            Spacer(Modifier.width(3.dp)); Text("Read", color = Sunflower, fontSize = 10.sp)
+                            Spacer(Modifier.width(3.dp)); Text("Read", color = Sunflower, fontSize = 14.sp)
                         } else {
                             Icon(Icons.Filled.Check, "sent", tint = PaperDim, modifier = Modifier.size(12.dp))
                         }
                     SendState.Failed ->
                         // [QW-ui] Retry exposed as a Button with a 48dp min touch target.
-                        Text("Not sent · tap to retry", color = Danger, fontSize = 10.sp,
+                        Text("Not sent · tap to retry", color = Danger, fontSize = 14.sp,
                             modifier = Modifier
                                 .sizeIn(minHeight = 48.dp)
                                 .clickable(role = Role.Button) { onRetry() }
@@ -1655,7 +1740,7 @@ private fun PasscodeSetupScreen(vm: AppViewModel) {
         0 -> "Choose a $len-digit code. You'll enter it every time you open Privacy Bolt."
         1 -> "Enter it once more to confirm."
         2 -> "A DIFFERENT $len-digit code. If you're ever forced to open the app, enter this " +
-             "instead of your unlock code — it erases everything in the app. Nothing will show that it did."
+             "instead of your unlock code — Android resets the app and closes it. Reopen it to sign in. Lodge and files saved outside the app are kept."
         else -> "Enter your emergency code once more."
     }
     PinPad(
@@ -1764,13 +1849,16 @@ private fun PinPad(
 
 @Composable
 private fun KeypadKey(enabled: Boolean, onClick: () -> Unit, content: @Composable () -> Unit) {
+    val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
     Box(
         Modifier
             .size(72.dp)
             .clip(CircleShape)
             .background(InkCard)
             .alpha(if (enabled) 1f else 0.35f)
-            .then(if (enabled) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier),
+            // A fading ripple on PIN keys reveals recently entered digits during unlock.
+            .then(if (enabled) Modifier.clickable(interactionSource = interaction, indication = null,
+                role = Role.Button, onClick = onClick) else Modifier),
         contentAlignment = Alignment.Center,
     ) { content() }
 }
@@ -1789,52 +1877,82 @@ private fun fmtDuration(ms: Long): String {
 
 /** The ecosystem home: a grid of apps shown after unlock. */
 @Composable
+private fun ConductorEntryScreen(vm: AppViewModel) {
+    val webui by vm.agentWebui.collectAsState()
+    val context = LocalContext.current
+    BackHandler { vm.goHome() }
+    LaunchedEffect(webui) {
+        if (webui?.backend == "agentnode") {
+            vm.goHome()
+            context.startActivity(Intent(context, AgentSettingsActivity::class.java))
+        }
+    }
+    Column(Modifier.fillMaxSize().background(Ink).systemBarsPadding().padding(24.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+        TextButton(onClick = { vm.goHome() }) { Text("Back") }
+        Text("Conductor", color = Paper, fontSize = 32.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Serif)
+        Text("Your private workspace", color = Sunflower, fontSize = 18.sp)
+        Text("Privacy Lodge installs Conductor and a Docker worker together. Once Lodge is ready, this screen opens your live stage and conversation. Connect Codex there to start working.", color = PaperDim, fontSize = 16.sp, lineHeight = 24.sp)
+        Button(onClick = { vm.openAgents() }) { Text("Check connection") }
+        Text("If this is an older installation, enable Agentnode in Privacy Lodge on your computer.", color = PaperDim, fontSize = 14.sp)
+    }
+}
+
+@Composable
+private fun AppNavigation(vm: AppViewModel, selected: String) {
+    NavigationBar(containerColor = InkSoft, contentColor = Paper) {
+        val destinations = listOf(
+            Triple("Home", Icons.Filled.Home, { vm.goHome() }),
+            Triple("Messages", Icons.AutoMirrored.Filled.Chat, { vm.openMessaging() }),
+            Triple("Files", Icons.Filled.Folder, { vm.openFilesApp() }),
+            Triple("Lodge", Icons.Filled.Settings, { vm.openConfig() }),
+        )
+        destinations.forEach { (label, icon, open) ->
+            NavigationBarItem(selected = selected == label, onClick = { if (selected != label) open() },
+                icon = { Icon(icon, null) }, label = { Text(label, maxLines = 1) },
+                colors = NavigationBarItemDefaults.colors(selectedIconColor = Sunflower,
+                    selectedTextColor = Sunflower, indicatorColor = InkCard,
+                    unselectedIconColor = PaperDim, unselectedTextColor = PaperDim))
+        }
+    }
+}
+
+@Composable
 private fun HomeScreen(vm: AppViewModel) {
     val ctx = LocalContext.current
     val webui by vm.agentWebui.collectAsState()
-    val installed by vm.agentsInstalled.collectAsState()
-    Column(Modifier.fillMaxSize().background(Ink).systemBarsPadding().padding(horizontal = 24.dp)) {
-        Spacer(Modifier.height(64.dp))
-        Text("Privacy Bolt", color = Paper, fontSize = 28.sp, fontWeight = FontWeight.Bold)
-        Text("Your apps", color = PaperDim, fontSize = 14.sp)
-        Spacer(Modifier.height(28.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            AppTile(Modifier.weight(1f), "Messaging", "Chats & calls",
-                Icons.AutoMirrored.Filled.Chat, Sunflower, true) { vm.openMessaging() }
-            AppTile(Modifier.weight(1f), "PP Config", "Your box",
-                Icons.Filled.Settings, Sunflower, true) { vm.openConfig() }
-        }
-        Spacer(Modifier.height(16.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            AppTile(Modifier.weight(1f), "Backup", "Your files on your box",
-                Icons.Filled.CloudUpload, Sunflower, true) { vm.openFilesApp() }
-            // Before setup there is nothing to talk to and nothing to configure, so ONE
-            // "Add agents" tile stands in for both. Two greyed-out tiles would just be two
-            // invitations to tap something that can't work yet.
-            if (installed) {
-                // Agents is its own app on purpose — never a tab inside Messaging, so it's
-                // always unambiguous whether the thing you're talking to is a person or an AI.
-                AppTile(Modifier.weight(1f), "Agents", "AI that runs on your box",
-                    Icons.Filled.SmartToy, Sunflower, true) { vm.openAgents() }
-            } else {
-                AppTile(Modifier.weight(1f), "Add agents", "Set up AI on your box",
-                    Icons.Filled.AddCircle, Sunflower, true) { vm.openAddAgents() }
-            }
-        }
-        if (installed) {
-            Spacer(Modifier.height(16.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                // Administering agents is a different act from talking to them, so it's a
-                // different app. Still gated on the WebUI address: a box can have agents
-                // provisioned before it has published where their control UI lives.
-                AppTile(Modifier.weight(1f), "Agent settings", "Configure your agents",
-                    Icons.Filled.Tune, Sunflower, webui != null) {
-                    ctx.startActivity(Intent(ctx, AgentSettingsActivity::class.java))
+    Scaffold(containerColor = Ink, bottomBar = { AppNavigation(vm, "Home") }) { pad ->
+    Column(Modifier.fillMaxSize().padding(pad).background(Ink)
+        .verticalScroll(rememberScrollState()).padding(horizontal = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Spacer(Modifier.height(20.dp))
+        Text("Privacy Bolt", color = PaperDim, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+        Text("Your private space", color = Paper, fontSize = 32.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Serif)
+        Surface(color = InkCard, shape = RoundedCornerShape(20.dp), modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Icon(Icons.Filled.SmartToy, contentDescription = null, tint = Sunflower, modifier = Modifier.size(28.dp))
+                    Text("Conductor", color = Paper, fontSize = 24.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Serif)
                 }
-                Spacer(Modifier.weight(1f))
+                Button(onClick = {
+                    if (webui?.backend == "agentnode") ctx.startActivity(Intent(ctx, AgentSettingsActivity::class.java))
+                    else vm.openAgents()
+                }, colors = ButtonDefaults.buttonColors(containerColor = Sunflower, contentColor = Ink),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), shape = RoundedCornerShape(14.dp)) {
+                    Text(if (webui?.backend == "agentnode") "Open Conductor" else "Set up Conductor")
+                }
             }
         }
+        Row(Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            AppTile(Modifier.weight(1f).fillMaxHeight(), "Messages", "People & calls",
+                Icons.AutoMirrored.Filled.Chat, Sunflower, true) { vm.openMessaging() }
+            AppTile(Modifier.weight(1f).fillMaxHeight(), "Files", "Back up & restore",
+                Icons.Filled.CloudUpload, Sunflower, true) { vm.openFilesApp() }
+        }
+        AppTile(Modifier.fillMaxWidth(), "Lodge", "Privacy Lodge · connection, storage & settings",
+            Icons.Filled.Settings, Sunflower, true) { vm.openConfig() }
+        Spacer(Modifier.height(16.dp))
     }
+}
 }
 
 @Composable
@@ -1853,904 +1971,15 @@ private fun AppTile(
             .background(InkCard)
             .then(if (enabled) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier)
             .alpha(if (enabled) 1f else 0.5f)
-            .padding(20.dp),
-    ) {
-        Icon(icon, null, tint = tint, modifier = Modifier.size(34.dp))
-        Spacer(Modifier.height(14.dp))
-        Text(title, color = Paper, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-        Text(sub, color = PaperDim, fontSize = 12.sp)
-    }
-}
-
-/**
- * Add agents — the one agent-shaped app you see before the add-on is set up.
- *
- * Also the change-the-password screen afterwards, because it is the same act: the password
- * is applied by re-running setup, which is idempotent on a box that already has agents.
- *
- * Why a password field at all. The agents' control UI can run shell commands, so it must
- * never be reachable without auth. The container will generate a password if you don't
- * choose one — that works, but it's a secret you've never seen, held only by your box. Most
- * people would rather pick their own, and be able to change it.
- */
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun AddAgentsScreen(vm: AppViewModel) {
-    val installed by vm.agentsInstalled.collectAsState()
-    val setupBusy by vm.agentSetupBusy.collectAsState()
-    val setupNotice by vm.agentSetupNotice.collectAsState()
-    val succeeded by vm.agentSetupSucceeded.collectAsState()
-    val ctx = LocalContext.current
-    var password by remember { mutableStateOf("") }
-    var confirm by remember { mutableStateOf("") }
-    BackHandler { vm.goHome() }
-
-    // Setup finished — carry on into Agent settings, which is where the remaining work lives
-    // (choosing a provider, a model). Stopping at "done" would leave the owner on the form
-    // they just submitted, guessing what comes next.
-    //
-    // The password goes with them: the box republishes the roster on its own schedule and the
-    // phone has to sync it, so for a moment the registry still holds the OLD one. We know the
-    // right password — nobody should be told "invalid password" for the password they just set.
-    LaunchedEffect(succeeded) {
-        if (!succeeded) return@LaunchedEffect
-        vm.consumeAgentSetupSucceeded()
-        vm.openAgents()
-        ctx.startActivity(
-            Intent(ctx, AgentSettingsActivity::class.java).apply {
-                if (password.isNotBlank()) {
-                    putExtra(AgentSettingsActivity.EXTRA_PASSWORD, password)
-                }
-            }
-        )
-    }
-
-    // Mismatch is worth blocking on: you can't discover a typo later by "forgot password" —
-    // there's no reset on a box only you can reach.
-    val mismatch = confirm.isNotEmpty() && password != confirm
-    val tooShort = password.isNotEmpty() && password.length < 8
-    val canSubmit = !setupBusy && !mismatch && !tooShort && (password.isEmpty() || confirm.isNotEmpty())
-
-    Scaffold(
-        containerColor = Ink,
-        topBar = {
-            TopAppBar(
-                title = {
-                    Text(
-                        if (installed) "Agent password" else "Add agents",
-                        color = Paper, fontWeight = FontWeight.Bold,
-                    )
-                },
-                navigationIcon = {
-                    IconButton(onClick = { vm.goHome() }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "back to apps", tint = Sunflower)
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft),
-            )
-        },
-    ) { pad ->
-        Column(
-            Modifier.fillMaxSize().padding(pad).padding(horizontal = 24.dp)
-                .verticalScroll(rememberScrollState()),
-        ) {
-            Spacer(Modifier.height(24.dp))
-            Icon(Icons.Filled.SmartToy, null, tint = SunflowerDim, modifier = Modifier.size(44.dp))
-            Spacer(Modifier.height(14.dp))
-            Text(
-                if (installed) "Change your agent password" else "Add agents to your box",
-                color = Paper, fontSize = 20.sp, fontWeight = FontWeight.Bold,
-            )
-            Spacer(Modifier.height(8.dp))
-            Text(
-                if (installed) {
-                    "This is the password for Agent settings — the control panel where your " +
-                        "agents are configured."
-                } else {
-                    "Your box runs the agents itself, over Tor, like everything else. Setup " +
-                        "happens on the box: nothing here needs a terminal."
-                },
-                color = PaperDim, fontSize = 13.sp,
-            )
-            Spacer(Modifier.height(22.dp))
-
-            PpField(password, { password = it }, "Agent settings password", password = true)
-            Spacer(Modifier.height(12.dp))
-            PpField(confirm, { confirm = it }, "Repeat password", password = true)
-            Spacer(Modifier.height(8.dp))
-            Text(
-                when {
-                    mismatch -> "The two passwords don't match."
-                    tooShort -> "Use at least 8 characters."
-                    password.isEmpty() && !installed ->
-                        "Leave blank and your box will generate a strong password for you — " +
-                            "the app fills it in, so you'll never have to type it."
-                    else ->
-                        "Your box keeps this password. It's only ever sent to your box, over Tor."
-                },
-                color = if (mismatch || tooShort) Danger else PaperDim,
-                fontSize = 12.sp,
-            )
-            Spacer(Modifier.height(22.dp))
-
-            // The whole setup happens ON THE BOX: it starts the agent runtime, provisions an
-            // agent account and publishes the roster.
-            Button(
-                onClick = { vm.setUpAgents(password) },
-                enabled = canSubmit,
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Sunflower, contentColor = Ink,
-                    disabledContainerColor = Outline, disabledContentColor = PaperDim,
-                ),
-            ) {
-                if (setupBusy) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = Ink,
-                    )
-                    Spacer(Modifier.width(10.dp))
-                    Text("Setting up…", fontWeight = FontWeight.Bold)
-                } else {
-                    Icon(
-                        if (installed) Icons.Filled.Lock else Icons.Filled.AddCircle,
-                        null, modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(Modifier.width(10.dp))
-                    Text(
-                        if (installed) "Save password" else "Set up agents",
-                        fontWeight = FontWeight.Bold,
-                    )
-                }
-            }
-            if (setupBusy) {
-                Spacer(Modifier.height(10.dp))
-                Text(
-                    "This can take a few minutes the first time — your box downloads the " +
-                        "agent runtime over Tor. You can leave this screen.",
-                    color = PaperDim, fontSize = 12.sp,
-                )
-            }
-            setupNotice?.let {
-                Spacer(Modifier.height(14.dp))
-                Text(it, color = Sunflower, fontSize = 13.sp)
-            }
-            Spacer(Modifier.height(32.dp))
-        }
-    }
-}
-
-/** What an agent can run on. `id` is the provider name Hermes uses in `model.provider`.
- *
- *  `oauth` is the load-bearing distinction. An API-key provider can be finished here, on
- *  the phone, with one text field. An OAuth one CANNOT: a Codex subscription is
- *  `auth_type = "oauth_external"` in Hermes — it keeps its own OAuth session and there is
- *  no key to type.
- *
- *  `deviceCode` narrows that further. A device-code provider prints a short code and waits,
- *  which IS completable from a phone — the box runs the blocking half and relays the code, and
- *  the owner types it into the browser they already have. Anything else OAuth still ends at
- *  "finish this in Agent settings".
- *
- *  Set `deviceCode` only for a provider whose flow has actually been observed to print a code.
- *  A provider that instead pops a local browser would leave the wizard waiting out the full
- *  timeout on a code that is never coming. Verified so far: openai-codex. */
-private data class AgentProvider(
-    val id: String,
-    val label: String,
-    val hint: String,
-    val oauth: Boolean = false,
-    val needsBaseUrl: Boolean = false,
-    val deviceCode: Boolean = false,
-)
-
-// GENERATED from Hermes's own provider catalog — do not hand-edit.
-// Regenerate with tools/gen-agent-providers.py after every HERMES_AGENT_REF bump; the
-// hand-written list this replaced carried six providers while Hermes shipped ~40.
-// Anything not listed (Mistral, a self-hosted endpoint) goes through "Custom endpoint".
-private val AGENT_PROVIDERS = listOf(
-    AgentProvider("", "Same as my other agents", "Copies the setup you already have."),
-    AgentProvider("nous", "Nous Research", "Hermes model family", oauth = true),
-    AgentProvider("fireworks", "Fireworks AI", "OpenAI-compatible direct model API"),
-    AgentProvider("openrouter", "OpenRouter", "unified API for 200+ models"),
-    AgentProvider("novita", "NovitaAI", "AI-native cloud for builders and agents"),
-    AgentProvider("lmstudio", "LM Studio", "Local desktop app with built-in model server", needsBaseUrl = true),
-    AgentProvider("anthropic", "Anthropic", "Claude models via API key or Claude Code"),
-    AgentProvider("openai-codex", "OpenAI Codex", "Codex CLI via ChatGPT subscription or API key", oauth = true, deviceCode = true),
-    AgentProvider("openai-api", "OpenAI API", "api.openai.com, API key"),
-    AgentProvider("alibaba", "Qwen Cloud", "Qwen Cloud / DashScope (Qwen + multi-provider)"),
-    AgentProvider("xai-oauth", "xAI Grok OAuth (SuperGrok / Premium+)", "xAI Grok OAuth (SuperGrok / Premium+ subscription)", oauth = true),
-    AgentProvider("xiaomi", "Xiaomi MiMo", "MiMo-V2.5 and V2 models: pro, omni, flash"),
-    AgentProvider("tencent-tokenhub", "Tencent TokenHub", "Hy3 Preview via tokenhub.tencentmaas.com"),
-    AgentProvider("nvidia", "NVIDIA NIM", "accelerated inference"),
-    AgentProvider("copilot", "GitHub Copilot", "Uses GITHUB_TOKEN or gh auth token"),
-    AgentProvider("huggingface", "HuggingFace", "HuggingFace Inference API"),
-    AgentProvider("gemini", "Google AI Studio", "Native Gemini API"),
-    AgentProvider("deepseek", "DeepSeek", "native DeepSeek API"),
-    AgentProvider("xai", "xAI", "xAI Grok (Direct API)"),
-    AgentProvider("zai", "Z.AI (GLM)", "Z.AI / GLM — Zhipu AI models"),
-    AgentProvider("kimi-coding", "Kimi / Kimi Coding Plan", "Kimi Coding Plan (api.kimi.com & Moonshot API)"),
-    AgentProvider("kimi-coding-cn", "Kimi / Moonshot (China)", "Kimi / Moonshot China (Domestic direct API)"),
-    AgentProvider("stepfun", "StepFun Step Plan", "Agent / coding models via Step Plan API"),
-    AgentProvider("minimax", "MiniMax", "Global direct API"),
-    AgentProvider("minimax-oauth", "MiniMax (OAuth)", "MiniMax via OAuth browser flow — no API key required", oauth = true),
-    AgentProvider("minimax-cn", "MiniMax (China)", "MiniMax China (Domestic direct API)"),
-    AgentProvider("ollama-cloud", "Ollama Cloud", "Cloud-hosted open models, ollama.com"),
-    AgentProvider("arcee", "Arcee AI", "Trinity models, direct API"),
-    AgentProvider("gmi", "GMI Cloud", "multi-model direct API (slash-form model IDs)"),
-    AgentProvider("kilocode", "Kilo Code", "Kilo Gateway API"),
-    AgentProvider("opencode-zen", "OpenCode Zen", "Curated models, pay-as-you-go"),
-    AgentProvider("opencode-go", "OpenCode Go", "Open models subscription"),
-    AgentProvider("azure-foundry", "Azure Foundry", "Microsoft Foundry - OpenAI-compatible endpoint (user-supplied base URL)", needsBaseUrl = true),
-    AgentProvider("ai-gateway", "Vercel AI Gateway", "Multi-model aggregator"),
-    AgentProvider("qwen-oauth", "Qwen OAuth (Portal)", "Qwen OAuth (Reuses local Qwen CLI login)", oauth = true),
-    AgentProvider("alibaba-coding-plan", "Alibaba Cloud (Coding Plan)", "Alibaba Cloud Coding Plan (Dedicated coding tier)"),
-    AgentProvider("deepinfra", "DeepInfra", "100+ open models, pay-per-use"),
-    AgentProvider("upstage", "Upstage Solar", "Upstage (Solar API)"),
-    AgentProvider("custom", "Custom endpoint", "Any OpenAI-compatible URL — Mistral, a self-hosted model, anything.", needsBaseUrl = true),
-)
-
-/** Name a new agent, choose what it runs on, and hand over a key if that provider needs one.
- *
- *  Client-side validation stays deliberately thin — only "is there a letter or digit in the
- *  name" — because the box owns the real rules (slugification, the reserved first-agent
- *  name, duplicates). Duplicating them here is how the two drift into disagreeing. */
-@Composable
-private fun AddAgentDialog(
-    busy: Boolean,
-    auth: AppViewModel.AuthFlow?,
-    onSignIn: (provider: String) -> Unit,
-    onClearAuth: () -> Unit,
-    onDismiss: () -> Unit,
-    onAdd: (name: String, provider: String, apiKey: String, baseUrl: String) -> Unit,
-) {
-    var step by remember { mutableStateOf(0) }
-    var name by remember { mutableStateOf("") }
-    var provider by remember { mutableStateOf(AGENT_PROVIDERS.first()) }
-    var apiKey by remember { mutableStateOf("") }
-    var baseUrl by remember { mutableStateOf("") }
-    // The list is generated from Hermes and runs to ~40 entries, which is a lot of
-    // scrolling on a phone to reach "Anthropic". Filter rather than reorder: a stable
-    // order means the provider you picked last time is where you left it.
-    var query by remember { mutableStateOf("") }
-
-    val trimmed = name.trim()
-    val nameOk = trimmed.any { it.isLetterOrDigit() }
-    // "Same as my other agents" and the OAuth providers both have nothing to type here, so
-    // the wizard is two steps for them and three for an API-key provider.
-    val needsCredentials = provider.id.isNotEmpty() && !provider.oauth
-    val credentialsOk = !needsCredentials ||
-        (apiKey.isNotBlank() && (!provider.needsBaseUrl || baseUrl.isNotBlank()))
-
-    fun finish() = onAdd(trimmed, provider.id, apiKey.trim(), baseUrl.trim())
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = InkSoft,
-        title = {
-            Text(
-                when (step) {
-                    0 -> "Add an agent"
-                    1 -> "What should it run on?"
-                    else -> provider.label
-                },
-                color = Paper, fontWeight = FontWeight.Bold,
-            )
-        },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                when (step) {
-                    0 -> {
-                        Text(
-                            "It gets its own account, its own chat, and its own settings — " +
-                                "so it can run a different model from your other agents.",
-                            color = PaperDim, fontSize = 14.sp,
-                        )
-                        Spacer(Modifier.height(16.dp))
-                        PpField(value = name, onChange = { name = it }, label = "Name")
-                        if (trimmed.isNotEmpty() && !nameOk) {
-                            Spacer(Modifier.height(8.dp))
-                            Text("Use at least one letter or number.", color = Sunflower, fontSize = 12.sp)
-                        }
-                    }
-                    1 -> {
-                        PpField(value = query, onChange = { query = it }, label = "Search")
-                        Spacer(Modifier.height(8.dp))
-                        val shown = AGENT_PROVIDERS.filter { p ->
-                            query.isBlank() ||
-                                p.label.contains(query, ignoreCase = true) ||
-                                p.hint.contains(query, ignoreCase = true) ||
-                                p.id.contains(query, ignoreCase = true)
-                        }
-                        if (shown.isEmpty()) {
-                            Text(
-                                "Nothing matches. Anything OpenAI-compatible works through " +
-                                    "\"Custom endpoint\".",
-                                color = PaperDim, fontSize = 13.sp,
-                            )
-                        }
-                        shown.forEach { p ->
-                            val on = p.id == provider.id
-                            Row(
-                                Modifier.fillMaxWidth()
-                                    .clickable { provider = p }
-                                    .padding(vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                RadioButton(selected = on, onClick = { provider = p })
-                                Spacer(Modifier.width(4.dp))
-                                Column {
-                                    Text(p.label, color = Paper, fontSize = 15.sp)
-                                    Text(p.hint, color = PaperDim, fontSize = 12.sp)
-                                }
-                            }
-                        }
-                    }
-                    else -> if (provider.deviceCode) {
-                        DeviceCodeStep(
-                            provider = provider,
-                            auth = auth?.takeIf { it.provider == provider.id },
-                            onSignIn = { onSignIn(provider.id) },
-                        )
-                    } else if (provider.oauth) {
-                        // No field, on purpose — see AgentProvider.oauth.
-                        Text(
-                            "${provider.label} signs in through a browser, so there's no key " +
-                                "to type here.",
-                            color = Paper, fontSize = 14.sp,
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        Text(
-                            "Your agent will be created now. To finish signing in, open " +
-                                "Agent settings, switch to the ${trimmed} profile, and sign " +
-                                "in there.",
-                            color = PaperDim, fontSize = 13.sp,
-                        )
-                    } else {
-                        if (provider.needsBaseUrl) {
-                            PpField(value = baseUrl, onChange = { baseUrl = it }, label = "Base URL")
-                            Spacer(Modifier.height(12.dp))
-                        }
-                        PpField(
-                            value = apiKey, onChange = { apiKey = it },
-                            label = "API key", password = true,
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        Text(
-                            "The key goes straight to your box and is stored there, only " +
-                                "readable by this agent.",
-                            color = PaperDim, fontSize = 12.sp,
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            val last = step == 2 || (step == 1 && provider.id.isEmpty())
-            val ready = when (step) {
-                0 -> nameOk
-                1 -> true
-                else -> credentialsOk
-            }
-            TextButton(
-                onClick = { if (last) finish() else step++ },
-                enabled = ready && !busy,
-            ) {
-                Text(
-                    if (last) "Add" else "Next",
-                    color = if (ready && !busy) Sunflower else SunflowerDim,
-                )
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = {
-                // Stepping back off the sign-in screen drops it: the next provider the owner
-                // picks is a different sign-in, and a leftover code belongs to neither.
-                if (step == 2) onClearAuth()
-                if (step == 0) onDismiss() else step--
-            }) {
-                Text(if (step == 0) "Cancel" else "Back", color = PaperDim)
-            }
-        },
-    )
-}
-
-/** The device-code sign-in step: ask, show the code, wait for the owner to use it.
- *
- *  The code is the whole screen while it exists. It is short-lived, has to be copied by hand
- *  into another app, and the owner is reading it off a phone — so it gets size, spacing and a
- *  copy button, not a line of body text.
- *
- *  Signing in is NOT required to leave this step. An agent whose provider isn't signed in yet
- *  is still a real agent, and trapping the owner in a dialog behind a third party's login —
- *  one that can fail for reasons neither we nor they control — would be worse than letting
- *  them finish and sign in from Agent settings later. */
-@Composable
-private fun DeviceCodeStep(
-    provider: AgentProvider,
-    auth: AppViewModel.AuthFlow?,
-    onSignIn: () -> Unit,
-) {
-    val ctx = LocalContext.current
-    val challenge = auth?.challenge
-    val running = auth != null && !auth.done
-
-    Text(
-        "${provider.label} signs in with your existing account, so there's no key to type.",
-        color = Paper, fontSize = 14.sp,
-    )
-    Spacer(Modifier.height(12.dp))
-
-    if (challenge != null) {
-        Text("Enter this code:", color = PaperDim, fontSize = 13.sp)
-        Spacer(Modifier.height(6.dp))
-        Text(
-            challenge.userCode,
-            color = Sunflower, fontSize = 30.sp, fontWeight = FontWeight.Bold,
-            // A sign-in code is read one character at a time; a proportional face makes
-            // 0/O and 1/I a guess.
-            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-            letterSpacing = 2.sp,
-        )
-        Spacer(Modifier.height(10.dp))
-        Row {
-            TextButton(onClick = {
-                val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
-                cm?.setPrimaryClip(
-                    android.content.ClipData.newPlainText("sign-in code", challenge.userCode)
-                )
-            }) { Text("Copy code", color = Sunflower) }
-            Spacer(Modifier.width(8.dp))
-            TextButton(onClick = {
-                // Opens in the phone's normal browser, NOT over Tor and not in one of our
-                // WebViews: this is a sign-in to the owner's own provider account, and it
-                // needs their existing session and password manager to work at all.
-                runCatching {
-                    ctx.startActivity(
-                        android.content.Intent(
-                            android.content.Intent.ACTION_VIEW,
-                            android.net.Uri.parse(challenge.verificationUri),
-                        ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    )
-                }
-            }) { Text("Open sign-in page", color = Sunflower, fontWeight = FontWeight.Bold) }
-        }
-        Spacer(Modifier.height(6.dp))
-        Text(challenge.verificationUri, color = PaperDim, fontSize = 12.sp)
-        Spacer(Modifier.height(12.dp))
-    }
-
-    when {
-        auth == null -> {
-            Text(
-                "Your box will start the sign-in and show you a code to enter.",
-                color = PaperDim, fontSize = 13.sp,
-            )
-            Spacer(Modifier.height(8.dp))
-            TextButton(onClick = onSignIn) {
-                Text("Sign in to ${provider.label}", color = Sunflower, fontWeight = FontWeight.Bold)
-            }
-        }
-        auth.done && auth.ok -> Text(
-            "Signed in. ${provider.label} is ready for this agent.",
-            color = Sunflower, fontSize = 14.sp, fontWeight = FontWeight.Bold,
-        )
-        auth.done -> {
-            Text(auth.status, color = Sunflower, fontSize = 13.sp)
-            Spacer(Modifier.height(8.dp))
-            TextButton(onClick = onSignIn) { Text("Try again", color = Sunflower) }
-        }
-        else -> Row(verticalAlignment = Alignment.CenterVertically) {
-            CircularProgressIndicator(
-                Modifier.size(16.dp), color = Sunflower, strokeWidth = 2.dp,
-            )
-            Spacer(Modifier.width(10.dp))
-            Text(
-                auth.status.ifBlank { "Waiting for your box…" },
-                color = PaperDim, fontSize = 13.sp,
-            )
-        }
-    }
-
-    if (!running) {
-        Spacer(Modifier.height(12.dp))
-        Text(
-            "You can add the agent without signing in and finish this later from Agent " +
-                "settings — it just won't be able to answer until you do.",
-            color = PaperDim, fontSize = 12.sp,
-        )
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun AgentsScreen(vm: AppViewModel) {
-    val groups by vm.agentGroups.collectAsState()
-    val loading by vm.agentsLoading.collectAsState()
-    val setupBusy by vm.agentSetupBusy.collectAsState()
-    val setupNotice by vm.agentSetupNotice.collectAsState()
-    val webui by vm.agentWebui.collectAsState()
-    val ctx = LocalContext.current
-    var addOpen by remember { mutableStateOf(false) }
-    // The agent the owner is about to remove. Held as state rather than removing on tap:
-    // this deletes a Matrix account and a chat history, and there is no undo.
-    var removing by remember { mutableStateOf<AppViewModel.AgentRow?>(null) }
-    // The agent whose conversation list is open, and the conversation the owner is about to
-    // delete. Both held as state rather than acted on at the tap: deleting a conversation
-    // destroys a history with no undo.
-    var sessionsFor by remember { mutableStateOf<AppViewModel.AgentRow?>(null) }
-    val sessionCounts by MatrixRepo.agentSessions.collectAsState()
-    BackHandler { vm.goHome() }
-
-    sessionsFor?.let { agent ->
-        AgentSessionsDialog(
-            agent = agent,
-            sessions = vm.sessionsFor(agent.userId, agent.roomId),
-            busy = setupBusy,
-            onOpen = { room, title ->
-                sessionsFor = null
-                vm.openAgentRoom(room, if (title == "Main chat") agent.name else title)
-            },
-            onNew = { title -> sessionsFor = null; vm.newAgentSession(agent.userId, title) },
-            onDelete = { room -> sessionsFor = null; vm.deleteAgentSession(room) },
-            onDismiss = { sessionsFor = null },
-        )
-    }
-
-    removing?.let { target ->
-        AlertDialog(
-            onDismissRequest = { removing = null },
-            containerColor = InkSoft,
-            title = { Text("Remove ${target.name}?", color = Paper, fontWeight = FontWeight.Bold) },
-            text = {
-                Text(
-                    "Its chat disappears from this phone and its account is closed on your " +
-                        "box. Anything it remembers is archived on the box, not deleted — but " +
-                        "the conversation is gone, and this can't be undone.",
-                    color = PaperDim, fontSize = 14.sp,
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    removing = null
-                    vm.removeAgent(target.userId, target.name)
-                }) { Text("Remove", color = Sunflower, fontWeight = FontWeight.Bold) }
-            },
-            dismissButton = {
-                TextButton(onClick = { removing = null }) { Text("Keep", color = PaperDim) }
-            },
-        )
-    }
-
-    val authFlow by vm.authFlow.collectAsState()
-    if (addOpen) AddAgentDialog(
-        busy = setupBusy,
-        auth = authFlow,
-        onSignIn = { vm.startAgentAuth(it) },
-        onClearAuth = { vm.clearAuthFlow() },
-        // Leaving the wizard drops the sign-in state, so reopening it doesn't show a code
-        // from a flow the box has already abandoned.
-        onDismiss = { addOpen = false; vm.clearAuthFlow() },
-        onAdd = { name, provider, apiKey, baseUrl ->
-            addOpen = false
-            vm.clearAuthFlow()
-            vm.setUpAgents(
-                agentName = name, provider = provider,
-                apiKey = apiKey, baseUrl = baseUrl,
-            )
-        },
-    )
-
-    Scaffold(
-        containerColor = Ink,
-        topBar = {
-            TopAppBar(
-                title = { Text("Agents", color = Paper, fontWeight = FontWeight.Bold) },
-                navigationIcon = {
-                    IconButton(onClick = { vm.goHome() }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, "back to apps", tint = Sunflower)
-                    }
-                },
-                actions = {
-                    // Add another agent. Each one gets its own Matrix account and its own
-                    // Hermes profile, so it can run a different model — or a different
-                    // subscription — from the ones already here.
-                    IconButton(onClick = { addOpen = true }, enabled = !setupBusy) {
-                        Icon(
-                            Icons.Filled.AddCircle, "add an agent",
-                            tint = if (setupBusy) SunflowerDim else Sunflower,
-                        )
-                    }
-                    // Change the Agent settings password. Lives here because once agents
-                    // exist the "Add agents" tile is gone, and the password would otherwise
-                    // be set-once — which is not a password, it's a fixed secret.
-                    IconButton(onClick = { vm.openAddAgents() }) {
-                        Icon(Icons.Filled.Lock, "change the agent password", tint = Sunflower)
-                    }
-                    // Shortcut to the same app as the home tile — you're most likely to want
-                    // to configure an agent while looking at the list of them.
-                    if (webui != null) {
-                        IconButton(onClick = {
-                            ctx.startActivity(Intent(ctx, AgentSettingsActivity::class.java))
-                        }) { Icon(Icons.Filled.Tune, "agent settings", tint = Sunflower) }
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = InkSoft),
-            )
-        },
-    ) { pad ->
-        if (groups.isEmpty()) {
-            Column(
-                Modifier.fillMaxSize().padding(pad).padding(horizontal = 24.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Spacer(Modifier.height(96.dp))
-                Icon(Icons.Filled.SmartToy, null, tint = SunflowerDim, modifier = Modifier.size(48.dp))
-                Spacer(Modifier.height(16.dp))
-                Text(
-                    if (loading) "Looking for agents…" else "No agents yet",
-                    color = Paper, fontSize = 18.sp, fontWeight = FontWeight.Bold,
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "Agents run on your box, over Tor, like everything else — and they stay " +
-                        "here, never in Messaging, so it's always clear who's a person.",
-                    color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center,
-                )
-                Spacer(Modifier.height(24.dp))
-                // One way in, so setup always passes through the screen that asks for a
-                // password — a second, password-less path would silently produce agents whose
-                // control UI the owner can't get into.
-                Button(
-                    onClick = { vm.openAddAgents() },
-                    enabled = !setupBusy,
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Sunflower, contentColor = Ink,
-                    ),
-                ) {
-                    if (setupBusy) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = Ink,
-                        )
-                        Spacer(Modifier.width(10.dp))
-                        Text("Setting up…", fontWeight = FontWeight.Bold)
-                    } else {
-                        Icon(Icons.Filled.SmartToy, null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(10.dp))
-                        Text("Set up agents", fontWeight = FontWeight.Bold)
-                    }
-                }
-                if (setupBusy) {
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        "This can take a few minutes the first time — your box downloads " +
-                            "the agent runtime over Tor. You can leave this screen.",
-                        color = PaperDim, fontSize = 12.sp, textAlign = TextAlign.Center,
-                    )
-                }
-                setupNotice?.let {
-                    Spacer(Modifier.height(14.dp))
-                    Text(it, color = Sunflower, fontSize = 13.sp, textAlign = TextAlign.Center)
-                }
-            }
-            return@Scaffold
-        }
-        LazyColumn(
-            Modifier.fillMaxSize().padding(pad).padding(horizontal = 24.dp),
-            contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp),
-        ) {
-            groups.forEach { (group, rows) ->
-                item(key = "hdr-$group") {
-                    Text(
-                        group.uppercase(),
-                        color = PaperDim, fontSize = 11.sp, fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(top = 18.dp, bottom = 8.dp),
-                    )
-                }
-                items(rows, key = { it.userId }) { r ->
-                    AgentRow(
-                        r,
-                        onClick = { r.roomId?.let { id -> vm.openAgentRoom(id, r.name) } },
-                        onRemove = { removing = r }.takeIf { !setupBusy },
-                        onSessions = { sessionsFor = r }.takeIf { r.roomId != null },
-                        // +1 for the main chat, which the box's session list doesn't carry.
-                        sessionCount = (sessionCounts[r.userId]?.size ?: 0) +
-                            if (r.roomId != null) 1 else 0,
-                    )
-                }
-            }
-        }
-    }
-}
-
-/** Pick, start or delete one of an agent's conversations.
- *
- *  Each conversation is a separate room, which is what makes it a separate memory on the box:
- *  the agent keys its history off the room, so two rooms are two threads it will not mix up.
- *  That is worth saying in the UI, because "new conversation" in most apps means a fresh
- *  scroll, and here it means the agent genuinely doesn't carry the other one over.
- *
- *  The main chat cannot be deleted from here. It is the room the agent was created with and
- *  the one the roster names; removing it would leave an agent with nowhere to talk while still
- *  listed — the litter state the Agents app exists to avoid. Removing the AGENT removes it. */
-@Composable
-private fun AgentSessionsDialog(
-    agent: AppViewModel.AgentRow,
-    sessions: List<AppViewModel.SessionRow>,
-    busy: Boolean,
-    onOpen: (roomId: String, title: String) -> Unit,
-    onNew: (title: String) -> Unit,
-    onDelete: (roomId: String) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    var naming by remember { mutableStateOf(false) }
-    var title by remember { mutableStateOf("") }
-    var confirmDelete by remember { mutableStateOf<AppViewModel.SessionRow?>(null) }
-
-    confirmDelete?.let { target ->
-        AlertDialog(
-            onDismissRequest = { confirmDelete = null },
-            containerColor = InkSoft,
-            title = { Text("Delete \"${target.title}\"?", color = Paper, fontWeight = FontWeight.Bold) },
-            text = {
-                Text(
-                    "This conversation disappears from this phone and its room is closed on " +
-                        "your box. ${agent.name} and its other conversations are untouched. " +
-                        "This can't be undone.",
-                    color = PaperDim, fontSize = 14.sp,
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = { val r = target.roomId; confirmDelete = null; onDelete(r) }) {
-                    Text("Delete", color = Sunflower, fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDelete = null }) { Text("Keep", color = PaperDim) }
-            },
-        )
-        return
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = InkSoft,
-        title = {
-            Text(
-                if (naming) "New conversation" else "${agent.name}'s conversations",
-                color = Paper, fontWeight = FontWeight.Bold,
-            )
-        },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                if (naming) {
-                    Text(
-                        "${agent.name} starts fresh here — it won't carry over what you " +
-                            "talked about in its other conversations.",
-                        color = PaperDim, fontSize = 13.sp,
-                    )
-                    Spacer(Modifier.height(14.dp))
-                    PpField(value = title, onChange = { title = it }, label = "What's it about?")
-                } else {
-                    sessions.forEach { s ->
-                        Row(
-                            Modifier.fillMaxWidth()
-                                .clickable(enabled = !busy) { onOpen(s.roomId, s.title) }
-                                .padding(vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text(s.title, color = Paper, fontSize = 15.sp, maxLines = 1)
-                                Text(
-                                    s.preview ?: if (s.main) "The chat it was created with"
-                                        else "No messages yet",
-                                    color = PaperDim, fontSize = 12.sp, maxLines = 1,
-                                )
-                            }
-                            // No delete on the main chat — see the doc comment.
-                            if (!s.main) {
-                                IconButton(onClick = { confirmDelete = s }, enabled = !busy) {
-                                    Icon(
-                                        Icons.Filled.DeleteOutline, "delete ${s.title}",
-                                        tint = PaperDim, modifier = Modifier.size(20.dp),
-                                    )
-                                }
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "Each conversation has its own memory on your box, so you can keep " +
-                            "separate topics apart.",
-                        color = PaperDim, fontSize = 12.sp,
-                    )
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = { if (naming) onNew(title.trim()) else { naming = true } },
-                enabled = !busy,
-            ) {
-                Text(
-                    if (naming) "Start" else "New conversation",
-                    color = if (busy) SunflowerDim else Sunflower, fontWeight = FontWeight.Bold,
-                )
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = { if (naming) naming = false else onDismiss() }) {
-                Text(if (naming) "Back" else "Close", color = PaperDim)
-            }
-        },
-    )
-}
-
-/** One agent in the Agents list. Visually distinct from a chat row on purpose. */
-@Composable
-private fun AgentRow(
-    r: AppViewModel.AgentRow,
-    onClick: () -> Unit,
-    onRemove: (() -> Unit)? = null,
-    onSessions: (() -> Unit)? = null,
-    sessionCount: Int = 0,
-) {
-    val ready = r.roomId != null
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(InkCard)
-            // Not tappable until there's a room to open — an agent is listed as soon as the
-            // box registers it, which can be before its room exists.
-            .then(if (ready) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier)
-            .alpha(if (ready) 1f else 0.6f)
             .padding(16.dp),
-        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(Icons.Filled.SmartToy, null, tint = Sunflower, modifier = Modifier.size(26.dp))
-        Spacer(Modifier.width(14.dp))
-        Column(Modifier.weight(1f)) {
-            Text(r.name, color = Paper, fontSize = 15.sp, fontWeight = FontWeight.Bold, maxLines = 1)
-            val sub = r.preview
-                ?: if (ready) r.description.ifBlank { "AI agent on your box" }
-                else "Starting up…"
-            Text(sub, color = PaperDim, fontSize = 12.sp, maxLines = 1)
-        }
-        // Conversations. Only labelled with a count once there is more than one — an agent
-        // with a single chat has nothing to choose between, and a "1" next to every row is
-        // noise that teaches the owner to ignore the number when it starts to matter.
-        if (onSessions != null) {
-            IconButton(onClick = onSessions) {
-                if (sessionCount > 1) {
-                    Text(
-                        "$sessionCount", color = Sunflower, fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold,
-                    )
-                } else {
-                    Icon(
-                        Icons.AutoMirrored.Filled.Chat, "conversations with ${r.name}",
-                        tint = PaperDim, modifier = Modifier.size(20.dp),
-                    )
-                }
-            }
-        }
-        // Deliberately a visible control rather than a long-press: removing an agent is the
-        // only way to stop a deleted one reappearing as a fake contact in Messaging, and a
-        // gesture nobody discovers would leave owners stuck with litter they can't clear.
-        if (onRemove != null) {
-            IconButton(onClick = onRemove) {
-                Icon(
-                    Icons.Filled.DeleteOutline, "remove ${r.name}",
-                    tint = PaperDim, modifier = Modifier.size(20.dp),
-                )
-            }
-        }
+        Icon(icon, null, tint = tint, modifier = Modifier.size(28.dp))
+        Spacer(Modifier.height(8.dp))
+        Text(title, color = Paper, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+        Text(sub, color = PaperDim, fontSize = 14.sp)
     }
 }
 
-/** PP Config — the box dashboard (health/address/version/pairings) + restart / reset. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ConfigScreen(vm: AppViewModel) {
@@ -2758,6 +1987,7 @@ private fun ConfigScreen(vm: AppViewModel) {
     val busy by vm.configBusy.collectAsState()
     val notice by vm.configNotice.collectAsState()
     var showReset by remember { mutableStateOf(false) }
+    var showRestart by remember { mutableStateOf(false) }
     var confirmName by remember { mutableStateOf("") }
     var showBackup by remember { mutableStateOf(false) }
     var bp1 by remember { mutableStateOf("") }
@@ -2778,7 +2008,7 @@ private fun ConfigScreen(vm: AppViewModel) {
         val data = vm.backupEnvelope.value
         if (uri != null && data != null) {
             val ok = runCatching {
-                ctx.contentResolver.openOutputStream(uri)?.use { it.write(data.toByteArray()) }
+                (ctx.contentResolver.openOutputStream(uri) ?: error("Could not open destination")).use { it.write(data.toByteArray()) }
             }.isSuccess
             vm.configNotice.value =
                 if (ok) "Backup saved. Keep it — and remember its passphrase."
@@ -2787,16 +2017,17 @@ private fun ConfigScreen(vm: AppViewModel) {
         vm.clearBackupEnvelope()
     }
     LaunchedEffect(envelope) {
-        if (envelope != null) { vm.beginExternalPick(); saveBackup.launch("privacy-bolt-backup.json") }
+        if (envelope != null) { vm.beginExternalPick(); saveBackup.launch("privacy-lodge-identity.json") }
     }
     LaunchedEffect(Unit) { vm.loadBoxStatus() }
     BackHandler { vm.goHome() }
 
     Scaffold(
         containerColor = Ink,
+        bottomBar = { AppNavigation(vm, "Lodge") },
         topBar = {
             TopAppBar(
-                title = { Text("PP Config", color = Paper, fontWeight = FontWeight.Bold) },
+                title = { Text("Lodge", color = Paper, fontWeight = FontWeight.Bold) },
                 navigationIcon = {
                     IconButton(onClick = { vm.goHome() }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "back to apps", tint = Sunflower)
@@ -2809,24 +2040,35 @@ private fun ConfigScreen(vm: AppViewModel) {
         Column(
             Modifier.padding(pad).fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
         ) {
+            OutlinedButton(onClick = { vm.showProfile() }, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Filled.AccountCircle, null, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(8.dp)); Text("Your profile & app privacy")
+            }
+            TextButton(onClick = {
+                ctx.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, ctx.packageName))
+            }, modifier = Modifier.fillMaxWidth()) { Text("Notification settings") }
+            Spacer(Modifier.height(12.dp))
             val s = st
             if (s == null) {
-                Text("Reading your box…", color = PaperDim)
+                Text("Connecting to Privacy Lodge…", color = PaperDim)
+                Text("Status is read from Lodge over Tor.", color = PaperDim, modifier = Modifier.padding(vertical = 12.dp))
+                OutlinedButton(onClick = { vm.loadBoxStatus() }, enabled = !busy) { Text("Refresh status") }
             } else {
                 Column(
                     Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(InkCard).padding(18.dp),
                 ) {
-                    Text(s.boxName.ifEmpty { "Your box" }, color = Paper, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Text(s.boxName.ifEmpty { "Lodge" }, color = Paper, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(4.dp))
-                    Text(s.onion, color = PaperDim, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                    Text(s.onion, color = PaperDim, fontSize = 13.sp, fontFamily = FontFamily.Monospace)
                     Spacer(Modifier.height(14.dp))
-                    HealthRow("Homeserver", s.homeserver)
+                    HealthRow("Messages & files", s.homeserver)
                     HealthRow("Tor", s.tor)
-                    HealthRow("Voice", s.voice)
+                    HealthRow("Calls", s.voice)
                     Spacer(Modifier.height(10.dp))
                     Text(
                         "Version ${s.version}  ·  ${s.pairedCount} contact${if (s.pairedCount == 1) "" else "s"}",
-                        color = PaperDim, fontSize = 12.sp,
+                        color = PaperDim, fontSize = 14.sp,
                     )
                 }
                 Spacer(Modifier.height(20.dp))
@@ -2842,7 +2084,7 @@ private fun ConfigScreen(vm: AppViewModel) {
                 )
                 Spacer(Modifier.height(20.dp))
                 Button(
-                    onClick = { vm.restartBox() }, enabled = !busy, modifier = Modifier.fillMaxWidth(),
+                    onClick = { showRestart = true }, enabled = !busy, modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(containerColor = InkCard, contentColor = Paper),
                 ) {
                     Icon(Icons.Filled.RestartAlt, null, modifier = Modifier.size(18.dp))
@@ -2855,22 +2097,23 @@ private fun ConfigScreen(vm: AppViewModel) {
                     colors = ButtonDefaults.buttonColors(containerColor = InkCard, contentColor = Paper),
                 ) {
                     Icon(Icons.Filled.CloudUpload, null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp)); Text("Back up my box")
+                    Spacer(Modifier.width(8.dp)); Text("Export box identity")
                 }
+                Text("An identity export restores your address, login and contacts. To include messages, files and agent workspaces, create a full backup on the machine running Privacy Lodge.", color = PaperDim, fontSize = 14.sp, modifier = Modifier.padding(top = 12.dp))
                 Spacer(Modifier.height(28.dp))
-                Text("Danger zone", color = Danger, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Text("Reset & removal", color = Danger, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
                 Button(
                     onClick = { confirmName = ""; showReset = true }, enabled = !busy,
                     modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = Color.White),
+                    colors = ButtonDefaults.buttonColors(containerColor = Danger, contentColor = Ink),
                 ) {
                     Icon(Icons.Filled.DeleteForever, null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp)); Text("Reset box")
                 }
                 Text(
-                    "Permanently erases your box — its address and all its data. Cannot be undone.",
-                    color = PaperDim, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp),
+                    "Permanently erases Lodge — its address and all its data. Cannot be undone.",
+                    color = PaperDim, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp),
                 )
             }
             if (notice != null) {
@@ -2880,19 +2123,27 @@ private fun ConfigScreen(vm: AppViewModel) {
         }
     }
 
+    if (showRestart) {
+        AlertDialog(onDismissRequest = { showRestart = false },
+            title = { Text("Restart Lodge?") },
+            text = { Text("Messages, calls and agent connections will be interrupted while Privacy Lodge restarts. Your data stays on the box.") },
+            confirmButton = { TextButton(onClick = { showRestart = false; vm.restartBox() }) { Text("Restart") } },
+            dismissButton = { TextButton(onClick = { showRestart = false }) { Text("Cancel") } })
+    }
+
     if (showReset && st != null) {
         AlertDialog(
             onDismissRequest = { showReset = false },
             containerColor = InkSoft,
-            title = { Text("Reset your box?", color = Paper) },
+            title = { Text("Reset Lodge?", color = Paper) },
             text = {
                 Column {
                     Text(
-                        "This permanently erases your box — its .onion address and all its data. It cannot be undone.",
+                        "This permanently erases Lodge — its .onion address and all its data. It cannot be undone.",
                         color = PaperDim, fontSize = 13.sp,
                     )
                     Spacer(Modifier.height(12.dp))
-                    Text("Type your box name to confirm:  ${st!!.boxName}", color = Paper, fontSize = 13.sp)
+                    Text("Type Lodge name to confirm:  ${st!!.boxName}", color = Paper, fontSize = 13.sp)
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
                         value = confirmName, onValueChange = { confirmName = it },
@@ -2914,13 +2165,13 @@ private fun ConfigScreen(vm: AppViewModel) {
 
     if (showBackup) {
         AlertDialog(
-            onDismissRequest = { showBackup = false },
+            onDismissRequest = { showBackup = false; bp1 = ""; bp2 = "" },
             containerColor = InkSoft,
-            title = { Text("Back up your box", color = Paper) },
+            title = { Text("Export box identity", color = Paper) },
             text = {
-                Column {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
                     Text(
-                        "Saves your box's identity — its address, login and contacts — as an encrypted " +
+                        "Saves Lodge's identity — its address, login and contacts — as an encrypted " +
                             "file you choose where to keep. Message history isn't included.",
                         color = PaperDim, fontSize = 13.sp,
                     )
@@ -2928,7 +2179,7 @@ private fun ConfigScreen(vm: AppViewModel) {
                     Text(
                         "Pick a passphrase. You'll need it to restore — if you lose it, the backup " +
                             "can't be opened by anyone, including you.",
-                        color = Sunflower, fontSize = 12.sp,
+                        color = Sunflower, fontSize = 14.sp,
                     )
                     Spacer(Modifier.height(12.dp))
                     OutlinedTextField(
@@ -2946,12 +2197,12 @@ private fun ConfigScreen(vm: AppViewModel) {
             },
             confirmButton = {
                 TextButton(
-                    onClick = { vm.backupBox(bp1); showBackup = false },
-                    enabled = bp1.length >= 8 && bp1 == bp2,
-                ) { Text("Back up", color = Sunflower) }
+                    onClick = { vm.backupBox(bp1); showBackup = false; bp1 = ""; bp2 = "" },
+                    enabled = bp1.length in 8..1024 && bp1 == bp2,
+                ) { Text("Export identity", color = Sunflower) }
             },
             dismissButton = {
-                TextButton(onClick = { showBackup = false }) { Text("Cancel", color = PaperDim) }
+                TextButton(onClick = { showBackup = false; bp1 = ""; bp2 = "" }) { Text("Cancel", color = PaperDim) }
             },
         )
     }
@@ -2963,20 +2214,20 @@ private fun ConfigScreen(vm: AppViewModel) {
             onDismissRequest = { showUpdate = false },
             containerColor = InkSoft,
             icon = { Icon(Icons.Filled.Download, null, tint = Sunflower) },
-            title = { Text("Update your box?", color = Paper) },
+            title = { Text("Update Lodge?", color = Paper) },
             text = {
                 Column {
                     Text("Version ${upd!!.current} → ${upd!!.latest}", color = Paper, fontSize = 14.sp,
                         fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(10.dp))
                     Text(
-                        "Your box downloads this over Tor and checks it's genuinely signed by " +
+                        "Lodge downloads this over Tor and checks it's genuinely signed by " +
                             "Privacy Bolt before installing. Your address, chats and contacts are kept.",
                         color = PaperDim, fontSize = 13.sp,
                     )
                     Spacer(Modifier.height(10.dp))
-                    Text("Your box goes offline for a moment while it restarts.",
-                        color = Sunflower, fontSize = 12.sp)
+                    Text("Lodge goes offline for a moment while it restarts.",
+                        color = Sunflower, fontSize = 14.sp)
                 }
             },
             confirmButton = {
@@ -3036,14 +2287,14 @@ private fun UpdateSection(
             Text("Version ${info.current}  →  ${info.latest}", color = Sunflower, fontSize = 14.sp,
                 fontWeight = FontWeight.Bold)
             if (info.released.isNotBlank()) {
-                Text("Released ${info.released}", color = PaperDim, fontSize = 11.sp)
+                Text("Released ${info.released}", color = PaperDim, fontSize = 13.sp)
             }
             if (info.notes.isNotEmpty()) {
                 Spacer(Modifier.height(10.dp))
-                Text("What's new", color = Paper, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Text("What's new", color = Paper, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(4.dp))
                 for (n in info.notes.take(6)) {
-                    Text("•  $n", color = PaperDim, fontSize = 12.sp,
+                    Text("•  $n", color = PaperDim, fontSize = 14.sp,
                         modifier = Modifier.padding(top = 2.dp))
                 }
             }
@@ -3062,17 +2313,17 @@ private fun UpdateSection(
                     }
                 }
                 Spacer(Modifier.height(8.dp))
-                Text("Your box checks the update is signed by Privacy Bolt before installing. " +
-                    "Your address, chats and contacts are kept.", color = PaperDim, fontSize = 11.sp)
+                Text("Lodge checks the update is signed by Privacy Bolt before installing. " +
+                    "Your address, chats and contacts are kept.", color = PaperDim, fontSize = 13.sp)
             } else if (info.kind != "docker") {
                 // Native box on an OS we don't publish a box for (Windows/macOS — the
                 // homeserver has no build there). Divert to Docker, the supported path.
                 // Must NOT claim the box "runs in Docker" — it doesn't, that's the point.
                 val toDocker = info.unsupportedOs || info.downloadUrl.isBlank()
                 Text(
-                    if (toDocker) "Run your box with Docker to get updates:"
+                    if (toDocker) "Run Lodge with Docker to get updates:"
                     else "Get this update for your computer:",
-                    color = Paper, fontSize = 12.sp,
+                    color = Paper, fontSize = 14.sp,
                 )
                 Spacer(Modifier.height(8.dp))
                 val copyable = if (toDocker) info.command.ifBlank { "docker pull jaimemelon/privacy-lodge-box:latest" }
@@ -3081,7 +2332,7 @@ private fun UpdateSection(
                     Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Ink).padding(12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(copyable, color = Sunflower, fontSize = 11.sp,
+                    Text(copyable, color = Sunflower, fontSize = 13.sp,
                         fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
                     IconButton(onClick = { onCopyCommand(copyable) }, modifier = Modifier.size(28.dp)) {
                         Icon(Icons.Filled.ContentCopy, "copy", tint = PaperDim, modifier = Modifier.size(16.dp))
@@ -3091,21 +2342,21 @@ private fun UpdateSection(
                 Text(
                     if (toDocker)
                         "Privacy Bolt only publishes a box for Linux right now, so updates can't " +
-                        "install on this computer. Running your box with Docker keeps it " +
+                        "install on this computer. Running Lodge with Docker keeps it " +
                         "updatable — your address, chats and contacts carry over."
-                    else "Download it on the computer running your box and install over the " +
+                    else "Download it on the computer running Lodge and install over the " +
                         "current version. Your identity and chats are kept.",
-                    color = PaperDim, fontSize = 11.sp,
+                    color = PaperDim, fontSize = 13.sp,
                 )
             } else {
                 // Docker: the container can't update itself — hand over the exact command.
-                Text("Run this on the computer running your box:", color = Paper, fontSize = 12.sp)
+                Text("Run this on the computer running Lodge:", color = Paper, fontSize = 14.sp)
                 Spacer(Modifier.height(8.dp))
                 Row(
                     Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(Ink).padding(12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(info.command, color = Sunflower, fontSize = 11.sp,
+                    Text(info.command, color = Sunflower, fontSize = 13.sp,
                         fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
                     IconButton(onClick = { onCopyCommand(info.command) }, modifier = Modifier.size(28.dp)) {
                         Icon(Icons.Filled.ContentCopy, "copy command", tint = PaperDim,
@@ -3113,21 +2364,21 @@ private fun UpdateSection(
                     }
                 }
                 Spacer(Modifier.height(8.dp))
-                Text("Your box runs in Docker, so it can't update itself — that would mean giving " +
+                Text("Lodge runs in Docker, so it can't update itself — that would mean giving " +
                     "the container control of the computer it runs on. Your identity and chats are kept.",
-                    color = PaperDim, fontSize = 11.sp)
+                    color = PaperDim, fontSize = 13.sp)
             }
         } else {
             Text(
                 when {
-                    info == null -> "Checking your box…"
+                    info == null -> "Checking Lodge…"
                     info.error != null -> "Couldn't check for updates — will retry."
-                    else -> "Your box is up to date  ·  v${info.current}"
+                    else -> "Lodge is up to date  ·  v${info.current}"
                 },
                 color = PaperDim, fontSize = 13.sp,
             )
             if (info?.checkedTs ?: 0L > 0L) {
-                Text("Last checked ${fmtAgo(info!!.checkedTs)}", color = PaperDim, fontSize = 11.sp)
+                Text("Last checked ${fmtAgo(info!!.checkedTs)}", color = PaperDim, fontSize = 13.sp)
             }
         }
 
@@ -3137,7 +2388,7 @@ private fun UpdateSection(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("Check automatically", color = Paper, fontSize = 13.sp)
-                Text("Once a day, over Tor", color = PaperDim, fontSize = 11.sp)
+                Text("Once a day, over Tor", color = PaperDim, fontSize = 13.sp)
             }
             Switch(
                 checked = autoCheck, onCheckedChange = onAutoCheck,
@@ -3154,15 +2405,20 @@ private fun UpdateSection(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun FilesScreen(vm: AppViewModel) {
+    var automaticBackups by rememberSaveable { mutableStateOf(false) }
+    var search by rememberSaveable { mutableStateOf("") }
     val files by vm.backupFiles.collectAsState()
+    val visibleFiles = files.filter { it.name.contains(search.trim(), ignoreCase = true) }
     val ready by vm.libraryReady.collectAsState()
+    val libraryHasMore by MatrixRepo.libraryHasMore.collectAsState()
+    val libraryLoadingMore by MatrixRepo.libraryLoadingMore.collectAsState()
     val uploading by vm.backupUploading.collectAsState()
     val partProgress by vm.backupPartProgress.collectAsState()
     val notice by vm.backupNotice.collectAsState()
     val scope = rememberCoroutineScope()
     val ctx = LocalContext.current
 
-    LaunchedEffect(Unit) { vm.openFilesApp() }
+
     BackHandler { vm.closeFilesApp() }
 
     // Pick any number of files (photos, videos, docs) to sync up.
@@ -3186,7 +2442,12 @@ private fun FilesScreen(vm: AppViewModel) {
                         vm.downloadBackupTo(f, out)
                     } ?: false
                 }.getOrDefault(false)
-                vm.backupNotice.value = if (ok) "Saved ${f.name}." else "Couldn't download ${f.name}."
+                val removed = ok || runCatching { android.provider.DocumentsContract.deleteDocument(ctx.contentResolver, uri) }.getOrDefault(false)
+                vm.backupNotice.value = when {
+                    ok -> "Saved ${f.name}."
+                    removed -> "Couldn't download ${f.name}. Please try again."
+                    else -> "Couldn't finish ${f.name}. Remove the incomplete file from the location you chose, then try again."
+                }
             }
         }
         pendingDownload = null
@@ -3222,9 +2483,10 @@ private fun FilesScreen(vm: AppViewModel) {
 
     Scaffold(
         containerColor = Ink,
+        bottomBar = { AppNavigation(vm, "Files") },
         topBar = {
             TopAppBar(
-                title = { Text("Backup", color = Paper, fontWeight = FontWeight.Bold) },
+                title = { Text("Files", color = Paper, fontWeight = FontWeight.Bold) },
                 navigationIcon = {
                     IconButton(onClick = { vm.closeFilesApp() }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "back to apps", tint = Sunflower)
@@ -3234,7 +2496,7 @@ private fun FilesScreen(vm: AppViewModel) {
             )
         },
         floatingActionButton = {
-            if (ready) {
+            if (ready && !automaticBackups) {
                 ExtendedFloatingActionButton(
                     onClick = { vm.beginExternalPick(); pick.launch(arrayOf("*/*")) },
                     containerColor = Sunflower, contentColor = Ink,
@@ -3246,6 +2508,10 @@ private fun FilesScreen(vm: AppViewModel) {
         },
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = !automaticBackups, onClick = { automaticBackups = false }, label = { Text("Library") })
+                FilterChip(selected = automaticBackups, onClick = { automaticBackups = true }, label = { Text("Automatic backups") })
+            }
             if (uploading > 0) {
                 Row(
                     Modifier.fillMaxWidth().background(InkCard).padding(14.dp),
@@ -3266,12 +2532,16 @@ private fun FilesScreen(vm: AppViewModel) {
                 Text(it, color = Sunflower, fontSize = 13.sp,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
             }
-            if (!ready) {
+            if (!ready && !automaticBackups) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Opening your library…", color = PaperDim)
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(if (notice == null) "Opening your library…" else "Your library is unavailable", color = PaperDim)
+                        OutlinedButton(onClick = { vm.openFilesApp() }) { Text("Try again") }
+                    }
                 }
             } else {
-                LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp)) {
+                LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 104.dp)) {
+                    if (automaticBackups) {
                     item {
                         KeepInSyncSection(
                             photosOn = photosOn, folders = folders, wifiOnly = wifiOnly,
@@ -3283,11 +2553,17 @@ private fun FilesScreen(vm: AppViewModel) {
                             onBatteryNotLow = { vm.setSyncBatteryNotLow(it) },
                             onSyncNow = { vm.kickSync() },
                         )
-                        Spacer(Modifier.height(18.dp))
-                        Text("On your box", color = PaperDim, fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 4.dp, bottom = 4.dp))
                     }
-                    if (files.isEmpty()) {
+                    } else {
+                    item {
+                        Text("Your file library", color = Paper, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                        Text("Files backed up to Lodge. Tap a file to save a copy to this device.", color = PaperDim, fontSize = 14.sp,
+                            modifier = Modifier.padding(top = 6.dp, bottom = 16.dp))
+                        OutlinedTextField(value = search, onValueChange = { search = it }, singleLine = true,
+                            label = { Text("Find a file") }, leadingIcon = { Icon(Icons.Filled.Search, null) },
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp))
+                    }
+                    if (visibleFiles.isEmpty()) {
                         item {
                             Column(
                                 Modifier.fillMaxWidth().padding(vertical = 28.dp),
@@ -3295,16 +2571,22 @@ private fun FilesScreen(vm: AppViewModel) {
                             ) {
                                 Icon(Icons.Filled.CloudUpload, null, tint = PaperDim, modifier = Modifier.size(40.dp))
                                 Spacer(Modifier.height(10.dp))
-                                Text("Nothing backed up yet", color = Paper, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                                Text(if (search.isNotBlank()) "No matching files loaded" else if (libraryHasMore) "No files in recent history" else "Your library is empty",
+                                    color = Paper, fontSize = 18.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
                                 Spacer(Modifier.height(4.dp))
-                                Text("Turn on a sync above, or tap “Back up files”.",
-                                    color = PaperDim, fontSize = 13.sp, textAlign = TextAlign.Center)
+                                Text(if (libraryHasMore) "Load earlier history to look for older backups." else if (search.isNotBlank()) "Try another file name." else "Choose files to back up, or set up automatic backups for photos and folders.",
+                                    color = PaperDim, fontSize = 14.sp, textAlign = TextAlign.Center)
                             }
                         }
                     } else {
-                        items(files, key = { it.key }) { f ->
+                        items(visibleFiles, key = { it.key }) { f ->
                             BackupFileRow(f) { pendingDownload = f; vm.beginExternalPick(); saveTo.launch(f.name) }
                         }
+                    }
+                    if (libraryHasMore) item {
+                        TextButton(onClick = { scope.launch { runCatching { MatrixRepo.loadMoreBackupFiles() }.onFailure { vm.backupNotice.value = "Couldn't load earlier files. Please try again." } } }, enabled = !libraryLoadingMore,
+                            modifier = Modifier.fillMaxWidth()) { Text(if (libraryLoadingMore) "Loading earlier files…" else "Load earlier files") }
+                    }
                     }
                 }
             }
@@ -3358,8 +2640,8 @@ private fun KeepInSyncSection(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(InkCard).padding(16.dp)
     ) {
         Text("Keep in sync", color = Paper, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-        Text("New files land on your box on their own — over Tor, encrypted.",
-            color = PaperDim, fontSize = 12.sp)
+        Text("New files land on Lodge on their own — over Tor, encrypted.",
+            color = PaperDim, fontSize = 14.sp)
         Spacer(Modifier.height(12.dp))
 
         // Camera-roll auto-backup
@@ -3368,7 +2650,7 @@ private fun KeepInSyncSection(
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text("Auto-back up photos & videos", color = Paper, fontSize = 14.sp)
-                Text("New shots upload automatically", color = PaperDim, fontSize = 12.sp)
+                Text("New shots upload automatically", color = PaperDim, fontSize = 14.sp)
             }
             Switch(checked = photosOn, onCheckedChange = onTogglePhotos,
                 colors = SwitchDefaults.colors(checkedTrackColor = Sunflower, checkedThumbColor = Ink))
@@ -3382,7 +2664,7 @@ private fun KeepInSyncSection(
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
                     Text(f.label, color = Paper, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text("Folder kept in sync", color = PaperDim, fontSize = 12.sp)
+                    Text("Folder kept in sync", color = PaperDim, fontSize = 14.sp)
                 }
                 IconButton(onClick = { onRemoveFolder(f.id) }) {
                     Icon(Icons.Filled.Close, "stop syncing this folder", tint = PaperDim, modifier = Modifier.size(20.dp))
@@ -3406,10 +2688,10 @@ private fun KeepInSyncSection(
             if (syncingCount > 0) {
                 CircularProgressIndicator(Modifier.size(14.dp), color = Sunflower, strokeWidth = 2.dp)
                 Spacer(Modifier.width(8.dp))
-                Text("Syncing $syncingCount…", color = Paper, fontSize = 12.sp)
+                Text("Syncing $syncingCount…", color = Paper, fontSize = 14.sp)
             } else {
                 Text(if (lastSyncMs == 0L) "Not synced yet" else "Last synced ${fmtAgo(lastSyncMs)}",
-                    color = PaperDim, fontSize = 12.sp)
+                    color = PaperDim, fontSize = 14.sp)
             }
             Spacer(Modifier.weight(1f))
             TextButton(onClick = onSyncNow) { Text("Sync now", color = Sunflower) }
@@ -3464,7 +2746,7 @@ private fun BackupFileRow(f: MatrixRepo.BackupFile, onDownload: () -> Unit) {
             }
             if (meta.isNotEmpty()) {
                 Text(meta, color = if (f.partsTotal > 0 && !f.complete) Sunflower else PaperDim,
-                    fontSize = 11.sp)
+                    fontSize = 13.sp)
             }
         }
         // Only a COMPLETE file can be downloaded — never hand back a truncated one.

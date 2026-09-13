@@ -55,6 +55,24 @@ import uniffi.matrix_sdk.VirtualElementCallWidgetProperties
  * force-relay through coturn-at-onion (proven path).
  */
 class ElementCallActivity : ComponentActivity() {
+    private var pendingPermission: PermissionRequest? = null
+    private val mediaPermission = registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()) {
+        val request = pendingPermission
+        pendingPermission = null
+        if (request != null) {
+            val allowed = request.resources.filter { resource ->
+                val permission = when (resource) {
+                    PermissionRequest.RESOURCE_AUDIO_CAPTURE -> android.Manifest.permission.RECORD_AUDIO
+                    PermissionRequest.RESOURCE_VIDEO_CAPTURE -> if (intent.getBooleanExtra(EXTRA_AUDIO_ONLY, false)) null else android.Manifest.permission.CAMERA
+                    else -> null
+                }
+                request.origin.toString().trimEnd('/') == "http://127.0.0.1:$EC_LOCAL" &&
+                    permission != null && checkSelfPermission(permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            }
+            if (allowed.isEmpty()) { request.deny(); overlayStatus?.text = "Allow microphone access to join the call."; overlayRetry?.visibility = View.VISIBLE }
+            else request.grant(allowed.toTypedArray())
+        }
+    }
     private val TAG = "PpCall"
     private lateinit var web: WebView
     private var ecOnion = ""
@@ -69,11 +87,12 @@ class ElementCallActivity : ComponentActivity() {
     // to the CALL's focus box, which for a cross-install call is the peer's box).
     private val peerFocusStarted = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val focusRe = Regex("(?:wss://|https://)([a-z2-7]{56}\\.onion):(?:7443|8443)")
-    // The box whose coturn carries this call's media. Starts as our own box, then is
-    // pinned to the real focus by Bridge.setTurnOnion when EC's ICE config reveals the
-    // turn:<onion> it actually uses (= the box whose SFU this call landed on). The TURN
-    // forwarder reads this live via its onion supplier, so updates take effect at once.
-    @Volatile private var turnOnion = ""
+    // Publisher and receiver can use different focus boxes concurrently. Keep
+    // every TURN destination immutable rather than retargeting one shared port.
+    private val turnRoutes = CallTurnRoutes(TURN_LOCAL, 17,
+        connect = { port, host -> TorNet.startTcpForwarder(port, { host }, 3478, TorManager.SOCKS_PORT) },
+        disconnect = { port -> TorNet.stopPort(port) },
+    )
 
     // Connect overlay: a branded "Connecting over Tor…" cover (EC's bundle loads over
     // Tor, ~10-20s of otherwise-blank screen) that turns into a clear error+retry if
@@ -89,8 +108,8 @@ class ElementCallActivity : ComponentActivity() {
     // INK / SUNFLOWER / PAPER / PAPERDIM as ARGB ints for the (non-Compose) overlay.
     // Kept in sync with ui/theme/Theme.kt's warm "candlelight" neutrals so the call
     // surface matches the rest of the app (and the desktop).
-    private val cInk = 0xFF16140F.toInt(); private val cSun = 0xFFF2B705.toInt()
-    private val cPaper = 0xFFECE6D7.toInt(); private val cDim = 0xFF9A9384.toInt()
+    private val cInk = 0xFFF7F2E9.toInt(); private val cSun = 0xFF9A4A32.toInt()
+    private val cPaper = 0xFF42392F.toInt(); private val cDim = 0xFF75614F.toInt()
     private val MATCH = FrameLayout.LayoutParams.MATCH_PARENT
 
     companion object {
@@ -120,7 +139,7 @@ class ElementCallActivity : ComponentActivity() {
         val onion = MatrixRepo.userId.substringAfter(":")  // box homeserver onion
         ecOnion = onion
         val audioOnly = intent.getBooleanExtra(EXTRA_AUDIO_ONLY, false)
-        Log.i(TAG, "call start: room=${runCatching { room.id() }.getOrNull()} box=$onion audioOnly=$audioOnly tor=${TorManager.state.value}")
+        Log.i(TAG, "call start: audioOnly=$audioOnly")
 
         // Local bridges: the WebView only ever talks to 127.0.0.1; we tunnel to the
         // onion over Tor (Chromium refuses .onion directly) and rewrite .onion URLs
@@ -142,32 +161,30 @@ class ElementCallActivity : ComponentActivity() {
             "ws://127.0.0.1:$SFU_LOCAL" to "wss://$onion:7443",
             "http://127.0.0.1:$HS_LOCAL" to "https://$onion:8009",
         ))
-        // Media over Tor: a TURN-over-TCP bridge to the call box's coturn. WebRTC
-        // can't use turn:<onion> directly (RFC7686), so we expose it at 127.0.0.1 and
-        // force the call to relay through it (see the injected patch below). The
-        // forwarder targets the call's coturn box, which the joiner only learns once
-        // the focus is discovered — hence the dynamic onion supplier.
-        turnOnion = onion
-        TorNet.startTcpForwarder(TURN_LOCAL, { turnOnion }, 3478, TorManager.SOCKS_PORT)
+        // TURN-over-TCP routes are assigned per box; concurrent focus connections
+        // must never switch an earlier peer connection to a different coturn.
         // Patch injected into the Element Call page: rewrite the SFU-advertised
         // turn:<onion>:3478 ICE server to our localhost bridge (keeping the box's
         // credentials) and force iceTransportPolicy=relay so ALL media rides Tor.
         val turnPatch = """
             <script>(function(){
               var N = window.RTCPeerConnection; if (!N || N.__pp) return;
+              var routes = Object.create(null);
               function fix(cfg){
                 cfg = cfg || {};
                 var list = cfg.iceServers || [];
                 list.forEach(function(s){
                   var u = s.urls; if (typeof u === 'string') u = [u];
                   if (u) s.urls = u.map(function(x){
-                    // The turn:<onion> EC was handed comes from the lk-jwt of the box
-                    // whose SFU this call actually uses (the focus). Report that onion
-                    // to native so the TURN forwarder tunnels to the SAME box's coturn
-                    // — never a stale peer focus from old call membership.
-                    var m = x.match(/turns?:([a-z2-7]{56}\.onion)/i);
-                    if (m) { try { ppAndroid.setTurnOnion(m[1]); } catch(e){} }
-                    return x.replace(/(turns?:)[a-z2-7]{56}\.onion(:[0-9]+)?/i, '${'$'}1127.0.0.1:$TURN_LOCAL');
+                    if (routes[x]) return routes[x];
+                    var m = x.match(/^turn:([a-z2-7]{56}\.onion)(?::3478)?(?=\?|$)/i);
+                    if (!m) throw new Error('Unsupported private call relay');
+                    var port = ppAndroid.setTurnOnion(m[1].toLowerCase());
+                    if (!port) throw new Error('Private call relay unavailable');
+                    var rewritten = x.replace(m[0], 'turn:127.0.0.1:' + port);
+                    routes[x] = rewritten; routes[rewritten] = rewritten;
+                    return rewritten;
+
                   });
                 });
                 cfg.iceServers = list;
@@ -201,10 +218,20 @@ class ElementCallActivity : ComponentActivity() {
         // Feature J: the Element Call web app is served BY THE BOX (onion:8444), not fetched
         // from call.element.io. A call now pulls nothing from the clearnet and contacts no
         // third party — which is what our privacy policy has always claimed.
-        TorNet.startHttpProxy(EC_LOCAL, "https://$onion:8444", TorManager.HTTP_PORT, ecRewrites, turnPatch + audioPatch)
-        TorNet.startHttpProxy(HS_LOCAL, "https://$onion:8009", TorManager.HTTP_PORT, ecRewrites)
-        TorNet.startHttpProxy(JWT_LOCAL, "https://$onion:8443", TorManager.HTTP_PORT, ecRewrites)
-        TorNet.startTlsForwarder(SFU_LOCAL, onion, 7443, TorManager.SOCKS_PORT)
+        try {
+            turnRoutes.portFor(onion)
+            TorNet.startHttpProxy(EC_LOCAL, "https://$onion:8444", TorManager.HTTP_PORT, ecRewrites, turnPatch + audioPatch)
+            TorNet.startHttpProxy(HS_LOCAL, "https://$onion:8009", TorManager.HTTP_PORT, ecRewrites)
+            TorNet.startHttpProxy(JWT_LOCAL, "https://$onion:8443", TorManager.HTTP_PORT, ecRewrites)
+            TorNet.startTlsForwarder(SFU_LOCAL, onion, 7443, TorManager.SOCKS_PORT)
+        } catch (error: Exception) {
+            listOf(TURN_LOCAL, EC_LOCAL, HS_LOCAL, JWT_LOCAL, SFU_LOCAL).forEach { TorNet.stopPort(it) }
+            rootView = FrameLayout(this).apply { addView(buildOverlay(), FrameLayout.LayoutParams(MATCH, MATCH)) }
+            setContentView(rootView)
+            Log.w(TAG, "Could not open call connections", error)
+            showCallError("The call connection couldn't start. Close any other call and try again.")
+            return
+        }
 
         // Pre-build the Tor circuits to our box's call services NOW, so when EC's
         // WebRTC fires its TURN allocation (the time-critical, late step) the onion
@@ -232,16 +259,23 @@ class ElementCallActivity : ComponentActivity() {
             }
             webChromeClient = object : WebChromeClient() {
                 override fun onPermissionRequest(request: PermissionRequest) {
-                    // grant mic/camera to the Element Call widget
-                    runOnUiThread { request.grant(request.resources) }
+                    runOnUiThread {
+                        if (request.origin.scheme != "http" || request.origin.host != "127.0.0.1" || request.origin.port != EC_LOCAL || pendingPermission != null) {
+                            request.deny(); return@runOnUiThread
+                        }
+                        val resources = request.resources.filter { it == PermissionRequest.RESOURCE_AUDIO_CAPTURE || (it == PermissionRequest.RESOURCE_VIDEO_CAPTURE && !audioOnly) }
+                        val needed = resources.map { if (it == PermissionRequest.RESOURCE_AUDIO_CAPTURE) android.Manifest.permission.RECORD_AUDIO else android.Manifest.permission.CAMERA }
+                        if (needed.all { checkSelfPermission(it) == android.content.pm.PackageManager.PERMISSION_GRANTED }) request.grant(resources.toTypedArray())
+                        else { pendingPermission = request; mediaPermission.launch(needed.toTypedArray()) }
+                    }
+                }
+                override fun onPermissionRequestCanceled(request: PermissionRequest) {
+                    if (pendingPermission == request) pendingPermission = null
                 }
                 override fun onConsoleMessage(m: android.webkit.ConsoleMessage): Boolean {
-                    val msg = m.message()
-                    // Elevate errors/focus chatter to INFO so they survive a PpCall:I filter.
-                    if (msg.contains("rror", true) || msg.contains("focus", true) || msg.contains("livekit", true))
-                        Log.i(TAG, "EC console: $msg @${m.sourceId()}:${m.lineNumber()}")
-                    else
-                        Log.d(TAG, "EC console: $msg @${m.sourceId()}:${m.lineNumber()}")
+                    // Element Call can log credentials, room identities and media-key
+                    // events. Consume its console without forwarding it to logcat,
+                    // including in debug builds used with real development accounts.
                     return true
                 }
             }
@@ -258,7 +292,7 @@ class ElementCallActivity : ComponentActivity() {
             kotlinx.coroutines.delay(35_000)
             if (!ecConnected) {
                 Log.w(TAG, "EC did not connect within 35s")
-                showCallError("Couldn't connect the call over Tor.\nYour box or your friend's may be slow or offline.")
+                showCallError("Couldn't connect the call over Tor.\nLodge or your friend's may be slow or offline.")
             }
         }
 
@@ -272,9 +306,8 @@ class ElementCallActivity : ComponentActivity() {
                     parentUrl = "http://127.0.0.1:$EC_LOCAL",
                     fontScale = null,
                     font = null,
-                    // Match the room: the shared room is unencrypted for this first
-                    // connect (E2EE calls = PerParticipantKeys, a follow-on toggle).
-                    encryption = EncryptionSystem.Unencrypted,
+                    // Participant keys keep media encrypted beyond the box's relay.
+                    encryption = EncryptionSystem.PerParticipantKeys,
                     posthogUserId = null,
                     posthogApiHost = null,
                     posthogApiKey = null,
@@ -310,8 +343,10 @@ class ElementCallActivity : ComponentActivity() {
                     .replace("https://$onion:8009", "http://127.0.0.1:$HS_LOCAL")
                     // Element Call's in-room widget view is under /room (root '/' is the
                     // standalone "start new call" home).
-                    .replace("127.0.0.1:$EC_LOCAL/#?", "127.0.0.1:$EC_LOCAL/room/#?")
-                if (BuildConfig.DEBUG) Log.i(TAG, "EC url: $url")
+                    // The audio-only/TURN bootstrap is injected per call. A fresh HTML
+                    // URL also bypasses documents cached by older builds; assets keep
+                    // their stable URLs and remain cached. The nonce must precede '#'.
+                    .replace("127.0.0.1:$EC_LOCAL/#?", "127.0.0.1:$EC_LOCAL/room/?pp_session=${java.util.UUID.randomUUID()}#?")
 
                 val driverAndHandle = makeWidgetDriver(settings)
                 val driver = driverAndHandle.driver
@@ -340,9 +375,6 @@ class ElementCallActivity : ComponentActivity() {
                         maybeStartPeerFocus(msg)
                         maybeDetectPeerLeft(msg)
                         for ((a, b) in ecRewrites) msg = msg.replace(a, b)
-                        if (BuildConfig.DEBUG && (msg.contains("foci_preferred") || msg.contains("focus_active")))
-                            Log.i(TAG, "FOCUS toWidget(full): $msg")
-                        if (BuildConfig.DEBUG) Log.i(TAG, "toWidget: ${msg.take(220)}")
                         withContext(Dispatchers.Main) {
                             web.evaluateJavascript("window.__ec && window.__ec().postMessage($msg, '*');", null)
                         }
@@ -356,7 +388,7 @@ class ElementCallActivity : ComponentActivity() {
                 val wrapper = """
                     <!doctype html><html><head>
                     <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-                    </head><body style="margin:0;background:#16140F">
+                    </head><body style="margin:0;background:#f7f2e9">
                     <iframe id="ec" src="$url"
                       allow="camera;microphone;autoplay;display-capture;clipboard-write;fullscreen"
                       style="position:fixed;inset:0;width:100%;height:100%;border:0"></iframe>
@@ -423,14 +455,14 @@ class ElementCallActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(dp(64), dp(64))
         })
         col.addView(TextView(this).apply {
-            text = "Privacy Bolt"; setTextColor(cPaper); setTextSize(TypedValue.COMPLEX_UNIT_PX, sp(24f))
+            text = if (intent.getBooleanExtra(EXTRA_AUDIO_ONLY, false)) "Private audio call" else "Private video call"; setTextColor(cPaper); setTextSize(TypedValue.COMPLEX_UNIT_PX, sp(24f))
             gravity = Gravity.CENTER; setPadding(0, dp(12), 0, dp(28))
             typeface = android.graphics.Typeface.DEFAULT_BOLD
         })
         overlayProgress = ProgressBar(this).apply { indeterminateTintList = android.content.res.ColorStateList.valueOf(cSun) }
         col.addView(overlayProgress)
         overlayStatus = TextView(this).apply {
-            text = "Connecting over Tor…\nThis can take 10–20 seconds."
+            text = "Connecting your call over Tor…\nKeep this screen open while both boxes connect."
             setTextColor(cDim); setTextSize(TypedValue.COMPLEX_UNIT_PX, sp(14f)); gravity = Gravity.CENTER
             setPadding(0, dp(18), 0, 0)
         }
@@ -450,17 +482,13 @@ class ElementCallActivity : ComponentActivity() {
 
     /** widget -> SDK (fromWidget messages). */
     inner class Bridge(private val handle: org.matrix.rustcomponents.sdk.WidgetDriverHandle) {
-        /** Called from the injected RTCPeerConnection patch with the focus onion that
-         *  EC's WebRTC is about to use for TURN. This — not call membership — is the
-         *  authoritative focus: it's whatever box's SFU/lk-jwt the call actually landed
-         *  on. Point the TURN forwarder there so relay + SFU share one box. */
+        /** Return the dedicated loopback port for the exact ICE server requested. */
         @JavascriptInterface
-        fun setTurnOnion(onion: String) {
-            if (onion.isEmpty() || onion == turnOnion) return
-            Log.i(TAG, "TURN focus onion (from EC ICE config) -> $onion")
-            turnOnion = onion
-            // Warm the circuit to the right coturn now, before WebRTC's allocation.
-            runCatching { TorNet.prewarm(onion, 3478, TorManager.SOCKS_PORT) }
+        fun setTurnOnion(onion: String): Int = try {
+            turnRoutes.portFor(onion)
+        } catch (error: Exception) {
+            Log.w(TAG, "Could not open the requested private call relay", error)
+            0
         }
 
         @JavascriptInterface
@@ -479,9 +507,6 @@ class ElementCallActivity : ComponentActivity() {
             // box can resolve it — a bare 127.0.0.1 would point at the peer's own box.
             var out = json
             for ((a, b) in ecReverse) out = out.replace(a, b)
-            if (BuildConfig.DEBUG && (out.contains("foci_preferred") || out.contains("focus_active")))
-                Log.i(TAG, "FOCUS fromWidget(full): $out")
-            if (BuildConfig.DEBUG) Log.i(TAG, "fromWidget: ${out.take(220)}")
             lifecycleScope.launch(Dispatchers.IO) {
                 val ok = runCatching { handle.send(out) }.getOrElse { Log.e(TAG, "send failed", it); false }
                 if (!ok) Log.w(TAG, "handle.send returned false")
@@ -500,8 +525,7 @@ class ElementCallActivity : ComponentActivity() {
     // present in an initial grace window as baseline (stale / pre-existing, never arms a
     // leave), and only auto-end for a peer we actually watched JOIN this session — then
     // debounce to ride out membership-refresh flaps over slow Tor.
-    private val presentPeers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-    private val confirmedJoiners = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val peerMemberships = CallMembershipTracker()
     @Volatile private var ending = false
     private var peerLeftCheck: kotlinx.coroutines.Job? = null
     private val BASELINE_MS = 6_000L     // members present this soon after start = stale/baseline
@@ -512,38 +536,24 @@ class ElementCallActivity : ComponentActivity() {
         val me = MatrixRepo.userId
         runCatching {
             val state = org.json.JSONObject(msg).optJSONObject("data")?.optJSONArray("state") ?: return
-            val nowPresent = HashSet<String>()
-            var sawAnyMember = false
+            val changes = ArrayList<CallMembershipTracker.Change>()
             for (i in 0 until state.length()) {
                 val e = state.optJSONObject(i) ?: continue
                 if (!e.optString("type").contains("call.member")) continue
-                sawAnyMember = true
                 val sk = e.optString("state_key")
-                if (sk.isEmpty() || sk.contains(me)) continue   // skip our own per-device membership
-                val content = e.optJSONObject("content")
-                val present = when {
-                    content == null -> false
-                    content.has("memberships") -> (content.optJSONArray("memberships")?.length() ?: 0) > 0
-                    else -> content.length() > 0          // empty {} ⇒ that member left
-                }
-                if (present) nowPresent.add(sk)
+                // Missing/malformed content is unknown, not an explicit leave.
+                val content = e.optJSONObject("content") ?: continue
+                val present = if (content.has("memberships")) {
+                    val memberships = content.optJSONArray("memberships") ?: continue
+                    memberships.length() > 0
+                } else content.length() > 0
+                changes.add(CallMembershipTracker.Change(sk, present))
             }
-            if (!sawAnyMember) return   // not a call-membership snapshot
-
-            val elapsed = android.os.SystemClock.elapsedRealtime() - callStartMs
-            if (elapsed < BASELINE_MS) {
-                // Baseline: accumulate pre-existing/stale members; never arm a leave on them.
-                presentPeers.addAll(nowPresent)
-                return
-            }
-            // A peer present now but not a moment ago = a genuine join this session.
-            for (sk in nowPresent) if (presentPeers.add(sk)) {
-                confirmedJoiners.add(sk)
-                Log.i(TAG, "peer joined the call: $sk")
-            }
-            presentPeers.retainAll(nowPresent)
-            val anyConfirmedPresent = confirmedJoiners.any { presentPeers.contains(it) }
-            if (confirmedJoiners.isNotEmpty() && !anyConfirmedPresent) {
+            if (changes.isEmpty()) return
+            val baseline = android.os.SystemClock.elapsedRealtime() - callStartMs < BASELINE_MS
+            // Merge by member: widget updates need not include every current peer.
+            // A self-only refresh previously erased the remote set and ended both calls.
+            if (peerMemberships.update(me, changes, baseline)) {
                 schedulePeerLeftEnd()
             } else {
                 peerLeftCheck?.cancel(); peerLeftCheck = null
@@ -557,8 +567,7 @@ class ElementCallActivity : ComponentActivity() {
         if (ending || peerLeftCheck?.isActive == true) return
         peerLeftCheck = lifecycleScope.launch {
             kotlinx.coroutines.delay(PEER_LEFT_DEBOUNCE_MS)
-            val anyBack = confirmedJoiners.any { presentPeers.contains(it) }
-            if (!anyBack && !ending) {
+            if (peerMemberships.shouldEnd() && !ending) {
                 ending = true
                 Log.i(TAG, "peer left the call (confirmed after debounce) -> ending on this side")
                 runOnUiThread {
@@ -710,6 +719,8 @@ class ElementCallActivity : ComponentActivity() {
         callRoomId?.let { MatrixRepo.clearMyCallMembership(it) }
         runCatching { web.destroy() }
         // Tear down the per-call Tor bridges/forwarders so they don't linger.
-        runCatching { TorNet.stopAll() }
+        turnRoutes.close()
+        listOf(EC_LOCAL, HS_LOCAL, JWT_LOCAL, SFU_LOCAL, JWT_PEER, SFU_PEER)
+            .forEach { runCatching { TorNet.stopPort(it) } }
     }
 }

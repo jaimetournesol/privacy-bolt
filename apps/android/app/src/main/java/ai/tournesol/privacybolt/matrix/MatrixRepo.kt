@@ -9,6 +9,9 @@ import ai.tournesol.privacybolt.tor.TorManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -214,7 +217,13 @@ object MatrixRepo {
      *  lives in one cohesive place instead of threading through the repo (W3-T3). */
     private val consent = ConsentRepository()
 
-    private var client: Client? = null
+    @Volatile private var client: Client? = null
+    private val sessionFence = SessionFence()
+    private val authenticationMutex = Mutex()
+    private val logoutMutex = Mutex()
+    private var signingOut = false
+    private var activeAuthentication: kotlinx.coroutines.Job? = null
+    private var clientOwner: SessionFence.Ticket? = null
     private var syncService: SyncService? = null
     private var roomListService: RoomListService? = null
     private var timeline: Timeline? = null
@@ -225,6 +234,7 @@ object MatrixRepo {
     private var roomList: RoomList? = null
     private var roomListResult: RoomListEntriesWithDynamicAdaptersResult? = null
     private var timelineHandle: TaskHandle? = null
+    private val timelineGuard = TimelineGuard()
     // Self-healing sync. The SyncService does NOT restart itself when it faults
     // (ERROR) or stops (TERMINATED) — which happens on a Tor circuit change, a
     // network blip, or the box restarting. Left unwatched, the phone silently
@@ -263,6 +273,7 @@ object MatrixRepo {
 
     val rooms = MutableStateFlow<List<RoomSummary>>(emptyList())
     val messages = MutableStateFlow<List<ChatMsg>>(emptyList())
+    val chatTimeline = MutableStateFlow(ChatTimelineState())
     val status = MutableStateFlow("")
 
     /** [H1] Set true when the session is HARD-revoked (a non-soft-logout auth error, or
@@ -315,13 +326,21 @@ object MatrixRepo {
     /** Is there a persisted session to restore? Lets the UI show a splash (not the
      *  empty login form) on a cold start for a returning user. */
     fun hasSavedSession(ctx: Context): Boolean =
-        runCatching { sessionPrefs(ctx).getString("at", null) != null }.getOrDefault(false)
+        runCatching {
+            sessionFence.use(sessionFence.capture()) {
+                !signingOut && sessionPrefs(ctx).getString("at", null) != null
+            }
+        }.getOrDefault(false)
 
-    private fun builder(ctx: Context, homeserverUrl: String?): ClientBuilder {
+    private fun builder(ctx: Context, homeserverUrl: String?, owner: SessionFence.Ticket, storeId: String?): ClientBuilder {
         appContext = ctx.applicationContext
-        val base = File(ctx.filesDir, "matrix").apply { mkdirs() }
-        val session = File(base, "session").apply { mkdirs() }
-        val cache = File(base, "cache").apply { mkdirs() }
+        // Old installations restore from matrix/{session,cache}. Every new login gets
+        // a unique store, so lingering native handles can never write into a new account.
+        val (session, cache) = sessionFence.use(owner) {
+            require(storeId == null || storeId.matches(Regex("[a-f0-9-]{36}"))) { "Invalid session store" }
+            val base = if (storeId == null) File(ctx.filesDir, "matrix") else File(ctx.filesDir, "matrix/$storeId")
+            File(base, "session").apply { mkdirs() } to File(base, "cache").apply { mkdirs() }
+        }
         var b = ClientBuilder()
             .sessionPaths(session.absolutePath, cache.absolutePath)
             .proxy(TorManager.proxyUrl)                 // route every request through Tor
@@ -347,7 +366,7 @@ object MatrixRepo {
             // rotated token only lived in memory, so the NEXT cold restore replayed a
             // stale token and 401'd. saveSessionInKeychain fires on each refresh — write
             // it straight to the encrypted prefs so restore always uses the live token.
-            .setSessionDelegate(sessionDelegate(ctx))
+            .setSessionDelegate(sessionDelegate(ctx, owner, storeId))
         if (homeserverUrl != null) b = b.homeserverUrl(homeserverUrl)
         return b
     }
@@ -358,27 +377,41 @@ object MatrixRepo {
      *  SDK's cross-process refresh read back the current session. We do NOT call
      *  disableAutomaticTokenRefresh — we WANT the SDK to keep refreshing; this delegate
      *  just makes the refresh durable. */
-    private fun sessionDelegate(ctx: Context): ClientSessionDelegate {
+    private fun sessionDelegate(ctx: Context, owner: SessionFence.Ticket, storeId: String?): ClientSessionDelegate {
         val app = ctx.applicationContext
         return object : ClientSessionDelegate {
             override fun saveSessionInKeychain(session: Session) {
-                runCatching { persist(app, session) }
-                    .onSuccess { Log.i(TAG, "session delegate: re-persisted rotated token") }
-                    .onFailure { Log.w(TAG, "session delegate: persist failed: ${it.message}") }
+                try {
+                    persist(app, session, owner, storeId)
+                } catch (_: java.util.concurrent.CancellationException) {
+                    // An old client has no authority to recreate a signed-out session.
+                } catch (_: Exception) {
+                    Log.w(TAG, "session delegate: credential persistence failed")
+                }
             }
-            override fun retrieveSessionFromKeychain(userId: String): Session {
+            override fun retrieveSessionFromKeychain(userId: String): Session = sessionFence.use(owner) {
                 val p = sessionPrefs(app)
-                val at = p.getString("at", null)
-                    ?: throw IllegalStateException("no stored session for $userId")
-                val hs = p.getString("hs", null)
-                    ?: throw IllegalStateException("no stored homeserver for $userId")
-                val ssv = runCatching { SlidingSyncVersion.valueOf(p.getString("ssv", "NATIVE")!!) }
-                    .getOrDefault(SlidingSyncVersion.NATIVE)
-                return Session(
-                    at, p.getString("rt", null), p.getString("uid", userId)!!,
-                    p.getString("did", "")!!, hs, p.getString("oauth", null), ssv
-                )
+                check(p.getString("uid", null) == userId) { "Stored account does not match client" }
+                readSession(p) ?: error("No stored session")
             }
+        }
+    }
+
+    private fun readSession(p: SharedPreferences): Session? {
+        val at = p.getString("at", null) ?: return null
+        val hs = p.getString("hs", null) ?: return null
+        val uid = p.getString("uid", null) ?: return null
+        val did = p.getString("did", null) ?: return null
+        val ssv = runCatching { SlidingSyncVersion.valueOf(p.getString("ssv", "NATIVE")!!) }
+            .getOrDefault(SlidingSyncVersion.NATIVE)
+        return Session(at, p.getString("rt", null), uid, did, hs, p.getString("oauth", null), ssv)
+    }
+
+    /** Call only under sessionFence, so a refresh cannot race the durable clear. */
+    private fun clearStoredSession(ctx: Context) {
+        check(sessionPrefs(ctx).edit().clear().commit()) { "Could not clear session storage" }
+        check(ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().commit()) {
+            "Could not clear legacy session storage"
         }
     }
 
@@ -386,7 +419,8 @@ object MatrixRepo {
      *  previous account/device causes the SDK's MismatchedAccount crypto error on a
      *  fresh login, so we always start a sign-in from clean state. */
     private fun wipeStore(ctx: Context) {
-        runCatching { File(ctx.filesDir, "matrix").deleteRecursively() }
+        val store = File(ctx.filesDir, "matrix")
+        check(!store.exists() || store.deleteRecursively()) { "Could not clear Matrix storage" }
     }
 
     /** [H1] Register the client delegate so a HARD auth error (token revoked / account
@@ -394,10 +428,9 @@ object MatrixRepo {
      *  the session down and routes the user to Login instead of retrying a dead token
      *  forever. A soft-logout (isSoftLogout=true) is the SDK's "your token rotated, I'll
      *  refresh" path — we leave that alone, the session delegate keeps it persisted. */
-    private fun registerClientDelegate(ctx: Context, c: Client) {
+    private fun registerClientDelegate(ctx: Context, c: Client, owner: SessionFence.Ticket) {
         val app = ctx.applicationContext
-        runCatching { clientDelegateHandle?.cancel() }
-        clientDelegateHandle = runCatching {
+        val handle = runCatching {
             c.setDelegate(object : ClientDelegate {
                 override fun didReceiveAuthError(isSoftLogout: Boolean) {
                     Log.w(TAG, "didReceiveAuthError(softLogout=$isSoftLogout)")
@@ -407,7 +440,7 @@ object MatrixRepo {
                         return
                     }
                     // Hard revoke: stop fighting it, clear the stored session, route to Login.
-                    handleHardAuthError(app)
+                    handleHardAuthError(app, owner)
                 }
                 override fun onBackgroundTaskErrorReport(
                     taskName: String,
@@ -416,96 +449,150 @@ object MatrixRepo {
                     Log.w(TAG, "background task error in $taskName: $error")
                 }
             })
-        }.getOrElse { Log.w(TAG, "setDelegate failed: ${it.message}"); null }
+        }.getOrElse { Log.w(TAG, "setDelegate failed"); null }
+        try {
+            val previous = sessionFence.use(owner) {
+                clientDelegateHandle.also { clientDelegateHandle = handle }
+            }
+            runCatching { previous?.cancel() }
+        } catch (t: java.util.concurrent.CancellationException) {
+            runCatching { handle?.cancel() }
+            throw t
+        }
     }
 
     /** [H1] A hard, unrecoverable auth failure: stop the sync retry loop, wipe the stored
      *  session + crypto store, and flip [authExpired] so AppViewModel routes to Login.
      *  Idempotent — guarded by authExpired so concurrent callers (delegate + retry-loop
      *  escalation) don't double-tear-down. Never called for a transient/soft error. */
-    private fun handleHardAuthError(ctx: Context) {
-        if (authExpired.value) return
-        Log.w(TAG, "hard auth error — clearing session and routing to Login")
-        runCatching { syncStateHandle?.cancel() }; syncStateHandle = null
-        val ss = syncService                              // stop() is suspend — do it off-thread
-        runCatching { sessionPrefs(ctx).edit().clear().apply() }
-        runCatching { ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().apply() }
-        wipeStore(ctx)                                    // [H1] also delete the on-disk crypto store so it matches the doc/report (login() also wipes it before re-auth)
-        client = null; syncService = null
-        scope.launch { runCatching { ss?.stop() } }
-        status.value = "Signed out — please sign in again."
-        authExpired.value = true
-    }
-
-    suspend fun login(ctx: Context, homeserverUrl: String, user: String, pass: String) {
-        status.value = "Connecting over Tor…"
-        wipeStore(ctx)                                  // clean crypto store for this sign-in
-        // Drop the cached recovery key — a fresh sign-in (possibly a different account)
-        // should re-read the authoritative key from the box's account data, not reuse a
-        // stale one. ensureKeyBackup then recovers this new device's keys from backup.
-        runCatching { sessionPrefs(ctx).edit().remove("rk").apply() }
-        val c = builder(ctx, homeserverUrl).build()
-        client = c
-        authExpired.value = false                       // [H1] fresh sign-in clears any prior expiry
-        registerClientDelegate(ctx, c)                  // [H1] watch for hard auth errors
-        status.value = "Signing in…"
-        // First sign-in on a freshly-provisioned box hits a COLD Tor circuit to a just-
-        // published onion descriptor: the POST /login intermittently times out on the
-        // first attempt or two even though the box is perfectly healthy (seen live — the
-        // box answered /login in ~2s from a warm circuit, yet the app's first try failed
-        // and the user had to tap Retry / relaunch). Retry a transient reach-failure a
-        // few times over the slow circuit before surfacing it, so a friend's very first
-        // sign-in "just works". A wrong password (isAuthError) is NOT transient — rethrow
-        // it at once so we never loop on bad credentials.
-        var attempt = 0
-        while (true) {
-            attempt++
+    private fun handleHardAuthError(ctx: Context, owner: SessionFence.Ticket) {
+        // The expected ticket is checked again when this coroutine runs. A delayed
+        // auth-error callback from the old client cannot sign out its replacement.
+        scope.launch {
             try {
-                c.login(user, pass, "Privacy Bolt Android", null)
-                break
-            } catch (t: Throwable) {
-                if (ai.tournesol.privacybolt.util.isAuthError(t) || attempt >= LOGIN_ATTEMPTS) throw t
-                Log.w(TAG, "login attempt $attempt failed (transient over Tor), retrying: ${t.message}")
-                status.value = "Signing in… still connecting over Tor"
-                kotlinx.coroutines.delay(LOGIN_RETRY_DELAY_MS)
+                duressWipe(ctx, expectedOwner = owner, expired = true)
+            } catch (_: java.util.concurrent.CancellationException) {
+                // Superseded account.
+            } catch (_: Exception) {
+                ai.tournesol.privacybolt.AccountPrivacy.gate.value = ai.tournesol.privacybolt.Gate.Locked
+                Log.w(TAG, "could not finish revoked-account cleanup")
             }
         }
-        userId = runCatching { c.userId() }.getOrDefault("@$user")
-        runCatching {
-            val s = c.session()
-            deviceId = s.deviceId
-            persist(ctx, s)
+    }
+
+    internal suspend fun login(ctx: Context, homeserverUrl: String, user: String, pass: String): SessionFence.Ticket {
+        if (client != null) duressWipe(ctx)
+        return authenticationMutex.withLock {
+            val job = kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]
+            val storeId = java.util.UUID.randomUUID().toString()
+            val owner = sessionFence.use(sessionFence.capture()) {
+                check(!signingOut) { "Sign-out is still finishing" }
+                check(client == null) { "Sign out before changing accounts" }
+                sessionFence.replace {
+                    clearStoredSession(ctx)
+                    // Also remove a store left by an abandoned/failed restore, when
+                    // there is no published client to take through normal sign-out.
+                    wipeStore(ctx)
+                    activeAuthentication = job
+                    status.value = "Connecting over Tor…"
+                }
+            }
+            var candidate: Client? = null
+            var published = false
+            try {
+                val c = builder(ctx, homeserverUrl, owner, storeId).build()
+                candidate = c
+                sessionFence.use(owner) { status.value = "Signing in…" }
+                var attempt = 0
+                while (true) {
+                    attempt++
+                    try {
+                        c.login(user, pass, "Privacy Bolt Android", null)
+                        break
+                    } catch (t: Throwable) {
+                        if (t is java.util.concurrent.CancellationException) throw t
+                        if (ai.tournesol.privacybolt.util.isAuthError(t) || attempt >= LOGIN_ATTEMPTS) throw t
+                        sessionFence.use(owner) { status.value = "Signing in… still connecting over Tor" }
+                        kotlinx.coroutines.delay(LOGIN_RETRY_DELAY_MS)
+                    }
+                }
+                val saved = c.session()
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                sessionFence.use(owner) {
+                    persist(ctx, saved, owner, storeId)
+                    userId = saved.userId; deviceId = saved.deviceId
+                    clientOwner = owner; client = c
+                    authExpired.value = false
+                    status.value = "Syncing…"
+                    published = true
+                }
+                registerClientDelegate(ctx, c, owner)
+                Log.i(TAG, "account signed in")
+                owner
+            } finally {
+                runCatching { sessionFence.use(owner) { if (activeAuthentication === job) activeAuthentication = null } }
+                if (!published) {
+                    runCatching { candidate?.close() }
+                    sessionFence.replaceIfCurrent(owner) { clearStoredSession(ctx) }
+                    runCatching { File(ctx.filesDir, "matrix/$storeId").deleteRecursively() }
+                }
+            }
         }
-        Log.i(TAG, "logged in as $userId (device $deviceId)")
-        status.value = "Syncing…"
     }
 
-    /** Restore a persisted session instead of re-logging in (avoids crypto-store
-     *  mismatch + survives app restarts). Returns false if no saved session. */
-    suspend fun tryRestore(ctx: Context): Boolean {
-        if (client != null) return true
-        val p = sessionPrefs(ctx)
-        val at = p.getString("at", null) ?: return false
-        val hs = p.getString("hs", null) ?: return false
-        status.value = "Restoring session over Tor…"
-        val c = builder(ctx, hs).build()
-        val ssv = runCatching { SlidingSyncVersion.valueOf(p.getString("ssv", "NATIVE")!!) }
-            .getOrDefault(SlidingSyncVersion.NATIVE)
-        val s = Session(
-            at, p.getString("rt", null), p.getString("uid", "")!!,
-            p.getString("did", "")!!, hs, p.getString("oauth", null), ssv
-        )
-        c.restoreSession(s)
-        client = c
-        authExpired.value = false                       // [H1] a successful restore is a live session
-        registerClientDelegate(ctx, c)                  // [H1] watch for hard auth errors
-        userId = s.userId
-        deviceId = s.deviceId
-        Log.i(TAG, "restored session for $userId (device $deviceId)")
-        return true
+    /** Only one caller can build/restore a store at a time. Capture before waiting,
+     * so queued work cannot silently attach to an account selected in the meantime. */
+    suspend fun tryRestore(ctx: Context): Boolean = restoreAccount(ctx) != null
+
+    internal suspend fun restoreAccount(ctx: Context): SessionFence.Ticket? {
+        val requested = sessionFence.capture()
+        return authenticationMutex.withLock {
+            val alreadyRestored = sessionFence.use(requested) { !signingOut && client != null }
+            if (alreadyRestored) return@withLock sessionFence.use(requested) { clientOwner }
+            val saved = sessionFence.use(requested) {
+                if (signingOut) return@use null
+                val p = sessionPrefs(ctx)
+                readSession(p)?.let { it to p.getString("store_id", null) }
+            } ?: return@withLock null
+            val job = kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]
+            val owner = sessionFence.use(requested) {
+                sessionFence.replace {
+                    activeAuthentication = job
+                    status.value = "Restoring session over Tor…"
+                }
+            }
+            var candidate: Client? = null
+            var published = false
+            try {
+                val c = builder(ctx, saved.first.homeserverUrl, owner, saved.second).build()
+                candidate = c
+                sessionFence.use(owner) { }
+                c.restoreSession(saved.first)
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                sessionFence.use(owner) {
+                    userId = saved.first.userId; deviceId = saved.first.deviceId
+                    clientOwner = owner; client = c
+                    authExpired.value = false
+                    published = true
+                }
+                registerClientDelegate(ctx, c, owner)
+                Log.i(TAG, "account session restored")
+                owner
+            } finally {
+                runCatching { sessionFence.use(owner) { if (activeAuthentication === job) activeAuthentication = null } }
+                if (!published) runCatching { candidate?.close() }
+            }
+        }
     }
 
-    private fun persist(ctx: Context, s: Session) {
+    /** UI publication is part of the same account transition as credential writes. */
+    internal fun withAccount(owner: SessionFence.Ticket, action: () -> Unit) = sessionFence.use(owner) {
+        if (signingOut || client == null || clientOwner !== owner)
+            throw java.util.concurrent.CancellationException("Account changed")
+        action()
+    }
+
+    private fun persist(ctx: Context, s: Session, owner: SessionFence.Ticket, storeId: String?) = sessionFence.use(owner) {
         sessionPrefs(ctx).edit()
             .putString("at", s.accessToken)
             .putString("rt", s.refreshToken)
@@ -514,6 +601,7 @@ object MatrixRepo {
             .putString("hs", s.homeserverUrl)
             .putString("oauth", s.oauthData)
             .putString("ssv", s.slidingSyncVersion.name)
+            .putString("store_id", storeId)
             .apply()
     }
 
@@ -601,17 +689,26 @@ object MatrixRepo {
     /** Read the recovery key: this device's encrypted prefs first, else account data on
      *  the box (so a fresh install/device that has neither still finds it). */
     private suspend fun readStoredRecoveryKey(c: Client, ctx: Context): String? {
-        sessionPrefs(ctx).getString("rk", null)?.let { return it }
-        return runCatching { c.accountData(RECOVERY_ACCOUNT_DATA) }.getOrNull()
+        val owner = ownerOf(c)
+        sessionFence.use(owner) { sessionPrefs(ctx).getString("rk", null) }?.let { return it }
+        val remote = c.accountData(RECOVERY_ACCOUNT_DATA)
+        sessionFence.use(owner) { }
+        return remote
             ?.let { runCatching { org.json.JSONObject(it).optString("key").ifBlank { null } }.getOrNull() }
     }
 
     private suspend fun persistRecoveryKey(c: Client, ctx: Context, key: String) {
-        sessionPrefs(ctx).edit().putString("rk", key).apply()
+        val owner = ownerOf(c)
+        sessionFence.use(owner) { sessionPrefs(ctx).edit().putString("rk", key).apply() }
         runCatching {
             if (c.accountData(RECOVERY_ACCOUNT_DATA) == null)
                 c.setAccountData(RECOVERY_ACCOUNT_DATA, org.json.JSONObject().put("key", key).toString())
         }
+    }
+
+    private fun ownerOf(c: Client): SessionFence.Ticket = sessionFence.use(sessionFence.capture()) {
+        if (c !== client) throw java.util.concurrent.CancellationException("Account changed")
+        clientOwner ?: throw java.util.concurrent.CancellationException("No active account")
     }
 
     /** Go offline WITHOUT signing out: stop the sync stream + its state watcher and
@@ -619,6 +716,7 @@ object MatrixRepo {
      *  can resume. Backs the Pause ("go dark") control together with TorManager.stop()
      *  and PpSyncService.stop(). Session, keys and consent are all left intact. */
     suspend fun pauseSync() {
+        invalidateChatTimeline()
         runCatching { syncStateHandle?.cancel() }; syncStateHandle = null; syncRestartDelayMs = 0L
         runCatching { timelineHandle?.cancel() }; timelineHandle = null
         runCatching { syncService?.stop() }
@@ -656,12 +754,24 @@ object MatrixRepo {
         }
     }
 
-    suspend fun startSync() {
+    internal suspend fun startSync(expectedOwner: SessionFence.Ticket? = null) {
         val c = client ?: error("not logged in")
+        val owner = expectedOwner ?: ownerOf(c)
+        sessionFence.use(owner) { }
         runCatching { loadConsent() }   // restore who we've already scanned
+        sessionFence.use(owner) { }
         val ss = c.syncService().finish()
-        syncService = ss
-        ss.start()
+        try {
+            sessionFence.use(owner) { syncService = ss }
+            ss.start()
+            sessionFence.use(owner) { }
+        } catch (t: Throwable) {
+            withContext(NonCancellable) {
+                runCatching { kotlinx.coroutines.withTimeoutOrNull(5_000) { ss.stop() } }
+                runCatching { ss.close() }
+            }
+            throw t
+        }
         // Watch the sync stream and self-heal. RUNNING -> reset backoff + reconcile
         // any room/pairing/call state that drifted while we were down. ERROR /
         // TERMINATED -> restart with capped exponential backoff. IDLE/OFFLINE are
@@ -723,6 +833,7 @@ object MatrixRepo {
         val rls = ss.roomListService()
         roomListService = rls
         val rl = rls.allRooms()
+        sessionFence.use(owner) { }
         roomList = rl                       // HOLD: dropping the RoomList cancels its stream
         val result = rl.entriesWithDynamicAdapters(
             200u,
@@ -732,6 +843,7 @@ object MatrixRepo {
                 }
             }
         )
+        sessionFence.use(owner) { }
         roomListResult = result            // HOLD: owns the entries-stream TaskHandle
         // populate: no extra filtering, just show every room we're in
         result.controller().setFilter(RoomListEntriesDynamicFilterKind.All(emptyList()))
@@ -774,6 +886,7 @@ object MatrixRepo {
                 }
             }
         }
+        sessionFence.use(owner) { }
     }
 
     /** Nudge the backstop poll the moment the app comes back to the foreground, so
@@ -1274,54 +1387,99 @@ object MatrixRepo {
         return n
     }
 
+    private fun invalidateChatTimeline() {
+        var handle: TaskHandle? = null
+        var old: Timeline? = null
+        timelineGuard.begin {
+            handle = timelineHandle; timelineHandle = null
+            old = timeline; timeline = null
+            timelineItems.clear(); sendHandles.clear()
+            messages.value = emptyList()
+            chatTimeline.value = ChatTimelineState()
+        }
+        runCatching { handle?.cancel() }
+        runCatching { old?.destroy() }
+    }
+
     suspend fun openRoom(roomId: String) {
-        val rls = roomListService ?: error("no room list")
-        timelineItems.clear()
-        sendHandles.clear()              // resend handles belong to the previous room's timeline
-        messages.value = emptyList()
-        val room = runCatching { rls.room(roomId) }.getOrNull()
-            ?: roomHandles[roomId] ?: error("room not found")
-        // NB: no auto-join here. Accepting a contact (joining the room) only happens
-        // by scanning the other person's code — the mutual-consent rule. The chat
-        // list routes a tap on an incoming request to the scanner instead of here.
-        // Tear down the previous room's timeline subscription before opening another,
-        // or the old TaskHandle leaks and stale diffs keep mutating timelineItems.
-        runCatching { timelineHandle?.cancel() }
-        timelineHandle = null
-        runCatching { timeline?.destroy() }
-        currentRoom = room
-        currentRoomId = roomId
-        val tl = room.timeline()
-        timeline = tl
-        timelineHandle = tl.addListener(object : TimelineListener {   // HOLD the handle
-            override fun onUpdate(diff: List<TimelineDiff>) {
-                applyTimelineDiffs(diff)
+        val owner = timelineGuard.begin {
+            timelineItems.clear()
+            sendHandles.clear()
+            messages.value = emptyList()
+            chatTimeline.value = ChatTimelineState(roomId = roomId, loading = true)
+        }
+        var created: Timeline? = null
+        var subscription: TaskHandle? = null
+        var retained = false
+        var previousTimeline: Timeline? = null
+        var previousHandle: TaskHandle? = null
+        try {
+            val rls = roomListService ?: error("no room list")
+            val room = runCatching { rls.room(roomId) }.getOrNull()
+                ?: roomHandles[roomId] ?: error("room not found")
+            // Opening never joins: contact acceptance still requires mutual consent.
+            val tl = room.timeline()
+            created = tl
+            val listener = timelineGuard.listener<List<TimelineDiff>>(owner) { applyTimelineDiffs(it) }
+            subscription = tl.addListener(object : TimelineListener {
+                override fun onUpdate(diff: List<TimelineDiff>) = listener.onUpdate(diff)
+            })
+            // Initial SDK callbacks are buffered until the complete subscription is
+            // installed. Only a fully constructed subscription can be replaced/closed.
+            val installed = try { listener.activate {
+                previousTimeline = timeline
+                previousHandle = timelineHandle
+                timeline = tl
+                timelineHandle = subscription
+                currentRoom = room
+                currentRoomId = roomId
+                retained = true
+                chatTimeline.value = chatTimeline.value.copy(ready = true)
+            } } finally {
+                runCatching { previousHandle?.cancel() }
+                runCatching { previousTimeline?.destroy() }
             }
-        })
-        runCatching { tl.paginateBackwards(50u.toUShort()) }
-        // [queue-unwedge] The SDK disables a room's send queue after an unrecoverable
-        // send error, and a disabled queue is SILENT: later messages sit on "sending…"
-        // forever as NotSentYet, never NotSent — so sendStateOf()'s auto-discard, which
-        // only fires on an observed SendingFailed, never runs. Observed live: two
-        // messages stuck for an hour with the room's last event unchanged, cleared only
-        // by force-stopping the app.
-        //
-        // Re-enabling is idempotent and cheap, but only do it when the flag is actually
-        // false so the log line means something when it appears.
-        runCatching {
-            if (!room.isSendQueueEnabled()) {
-                Log.w(TAG, "send queue was disabled for $roomId — re-enabling")
-                room.enableSendQueue(true)
+            if (!installed) throw kotlinx.coroutines.CancellationException("Another chat was opened")
+            tl.paginateBackwards(50u.toUShort())
+            if (!timelineGuard.update(owner) {
+                chatTimeline.value = chatTimeline.value.copy(loading = false)
+            }) throw kotlinx.coroutines.CancellationException("Another chat was opened")
+            // [queue-unwedge] The SDK disables a room's send queue after an unrecoverable
+            // send error, and a disabled queue is SILENT: later messages sit on "sending…"
+            // forever as NotSentYet, never NotSent — so sendStateOf()'s auto-discard, which
+            // only fires on an observed SendingFailed, never runs. Observed live: two
+            // messages stuck for an hour with the room's last event unchanged, cleared only
+            // by force-stopping the app.
+            //
+            // Re-enabling is idempotent and cheap, but only do it when the flag is actually
+            // false so the log line means something when it appears.
+            runCatching {
+                if (!room.isSendQueueEnabled()) {
+                    Log.w(TAG, "send queue was disabled for $roomId — re-enabling")
+                    room.enableSendQueue(true)
+                }
+            }.onFailure { Log.w(TAG, "send-queue check failed for $roomId: ${it.message}") }
+            // [key-warmup] Opening a chat is the "about to converse" signal: pre-fetch the peer's
+            // device keys now, in the background over Tor, so by the time the user types + sends
+            // the first message the megolm key can be shared to their device (and it decrypts).
+            // Debounced, so reopening a warm chat is a no-op; the send path re-checks as a belt.
+            // Resolve the peer from heroes() (works on BOTH sides) and fall back to m.direct —
+            // NOT m.direct alone, which only the room's creator tags (the joiner has no entry).
+            if (!timelineGuard.update(owner) {
+                maybeMarkRead()
+                scope.launch { warmUpKeys(peerId(room) ?: directPeerOf(roomId)) }
+            }) throw kotlinx.coroutines.CancellationException("Another chat was opened")
+        } catch (error: Exception) {
+            if (!retained) {
+                runCatching { subscription?.cancel() }
+                runCatching { created?.destroy() }
             }
-        }.onFailure { Log.w(TAG, "send-queue check failed for $roomId: ${it.message}") }
-        maybeMarkRead()   // opening a room counts as reading it (if opted in)
-        // [key-warmup] Opening a chat is the "about to converse" signal: pre-fetch the peer's
-        // device keys now, in the background over Tor, so by the time the user types + sends
-        // the first message the megolm key can be shared to their device (and it decrypts).
-        // Debounced, so reopening a warm chat is a no-op; the send path re-checks as a belt.
-        // Resolve the peer from heroes() (works on BOTH sides) and fall back to m.direct —
-        // NOT m.direct alone, which only the room's creator tags (the joiner has no entry).
-        scope.launch { warmUpKeys(peerId(room) ?: directPeerOf(roomId)) }
+            timelineGuard.update(owner) {
+                chatTimeline.value = chatTimeline.value.copy(loading = false,
+                    error = "Couldn't load this conversation. Check your connection and retry.")
+            }
+            throw error
+        }
     }
 
     /** True if the user opted in to sending read receipts (Profile → "Send read
@@ -1374,6 +1532,7 @@ object MatrixRepo {
                 if (peerRead) readHorizon = i
             }
             messages.value = timelineItems.mapIndexedNotNull { i, item -> item.toChatMsg(userId, i <= readHorizon) }
+            chatTimeline.value = chatTimeline.value.copy(messages = messages.value)
         }
         // If we've opted in, mark the open room read (federates our receipt to the peer).
         maybeMarkRead()
@@ -1453,10 +1612,10 @@ object MatrixRepo {
                 val sender = ev.sender
                 val ts = runCatching { ev.timestamp.toLong() }.getOrDefault(0L)
                 val sid = (kind.msg as? EncryptedMessage.MegolmV1AesSha2)?.sessionId
-                Log.w(TAG, "UTD event from $sender ts=$ts session=$sid")
+                Log.i(TAG, "Message is waiting for an encryption key")
                 maybeRecoverFromUtd(sid)   // [UTD-recovery] re-sync to re-apply the missing key
                 val key = runCatching { ev.eventOrTransactionId.toString() }.getOrDefault("utd:$sender:$ts")
-                return ChatMsg(key, sender, "🔒 Can't decrypt this message", sender == me, ts)
+                return ChatMsg(key, sender, "Waiting for encryption keys. Reconnect to retry; this message may need to be sent again.", sender == me, ts)
             }
         }
         // Call events become a persistent call-log row (with a tap to call back). The
@@ -1546,16 +1705,18 @@ object MatrixRepo {
         return state == uniffi.matrix_sdk_base.EncryptionState.NOT_ENCRYPTED
     }
 
-    suspend fun send(text: String) {
-        val tl = timeline ?: return
+    suspend fun send(text: String, expectedRoomId: String? = null) {
+        check(expectedRoomId == null || currentRoomId == expectedRoomId) { "Chat changed" }
+        val tl = timeline ?: error("Chat is not ready")
+        val targetRoom = currentRoom ?: error("Chat is not ready")
         // [H4] Never send cleartext: if the open room is confirmed unencrypted, refuse
         // and surface a clear error rather than leaking the message in the clear. A
         // no-op for our normal E2EE DMs (latestEncryptionState() == ENCRYPTED).
-        currentRoom?.let { room ->
+        targetRoom.let { room ->
             if (isConfirmedUnencrypted(room)) {
                 Log.w(TAG, "refusing to send into a non-encrypted room ${runCatching { room.id() }.getOrNull()}")
                 status.value = "Not sent — this chat isn't encrypted."
-                return
+                error("This chat is not encrypted")
             }
         }
         // [key-warmup] Guarantee the peer's device keys are downloaded BEFORE we send, so the
@@ -1563,7 +1724,7 @@ object MatrixRepo {
         // their side). openRoom already kicked this off in the background, so this is normally
         // an instant debounce hit; only a genuinely-cold first send waits, and only up to a
         // bounded budget so a hung circuit can never freeze the composer.
-        currentRoom?.let { room ->
+        targetRoom.let { room ->
             kotlinx.coroutines.withTimeoutOrNull(KEY_WARMUP_SEND_BUDGET_MS) {
                 warmUpKeys(peerId(room) ?: directPeerOf(room.id()))
             }
@@ -1595,24 +1756,23 @@ object MatrixRepo {
     }
 
     /** Reply to [eventId] with [text] — federates a proper m.in_reply_to relation. */
-    suspend fun replyToMessage(eventId: String, text: String) {
-        val tl = timeline ?: return
-        if (refuseIfUnencrypted()) return
-        runCatching { tl.sendReply(messageEventContentFromMarkdown(text), eventId) }
-            .onFailure { Log.w(TAG, "reply to $eventId failed: ${it.message}") }
+    suspend fun replyToMessage(eventId: String, text: String, expectedRoomId: String? = null) {
+        check(expectedRoomId == null || currentRoomId == expectedRoomId) { "Chat changed" }
+        val tl = timeline ?: error("Chat is not ready")
+        val targetRoom = currentRoom ?: error("Chat is not ready")
+        check(!isConfirmedUnencrypted(targetRoom)) { "This chat is not encrypted" }
+        tl.sendReply(messageEventContentFromMarkdown(text), eventId)
     }
 
-    /** Edit our own message [eventId] to [newText] (federates an m.replace edit). */
-    suspend fun editMessage(eventId: String, newText: String) {
-        val tl = timeline ?: return
-        if (refuseIfUnencrypted()) return
-        runCatching {
-            tl.edit(
-                org.matrix.rustcomponents.sdk.EventOrTransactionId.EventId(eventId),
-                org.matrix.rustcomponents.sdk.EditedContent.RoomMessage(messageEventContentFromMarkdown(newText)),
-            )
-        }.onFailure { Log.w(TAG, "edit $eventId failed: ${it.message}") }
+    suspend fun editMessage(eventId: String, newText: String, expectedRoomId: String? = null) {
+        check(expectedRoomId == null || currentRoomId == expectedRoomId) { "Chat changed" }
+        val tl = timeline ?: error("Chat is not ready")
+        val targetRoom = currentRoom ?: error("Chat is not ready")
+        check(!isConfirmedUnencrypted(targetRoom)) { "This chat is not encrypted" }
+        tl.edit(org.matrix.rustcomponents.sdk.EventOrTransactionId.EventId(eventId),
+            org.matrix.rustcomponents.sdk.EditedContent.RoomMessage(messageEventContentFromMarkdown(newText)))
     }
+
 
     /** Set our own display name — federates to paired peers, who then see it above our
      *  messages instead of our onion localpart. Passing a blank string clears it (peers
@@ -1846,7 +2006,7 @@ object MatrixRepo {
         if (!cut) {
             rebuildRooms()
             throw java.io.IOException(
-                "Couldn't reach your box to cut them off — still connected; try again."
+                "Couldn't reach Lodge to cut them off — still connected; try again."
             )
         }
         if (notify) {
@@ -2100,58 +2260,77 @@ object MatrixRepo {
         Log.i(TAG, "ensureInvited: initial burst done for $peer; sync reconcile will keep re-inviting")
     }
 
-    /** Sign out: best-effort server logout, then wipe the local session so the
-     *  next launch lands on Login. */
-    suspend fun logout(ctx: Context) {
-        runCatching { syncService?.stop() }
-        runCatching { client?.logout() }
-        runCatching { sessionPrefs(ctx).edit().clear().apply() }
-        runCatching { ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().apply() }
-        runCatching { timelineHandle?.cancel() }
-        runCatching { syncStateHandle?.cancel() }; syncStateHandle = null; syncRestartDelayMs = 0L
-        runCatching { clientDelegateHandle?.cancel() }; clientDelegateHandle = null   // [H1]
-        syncHardFailures = 0; authExpired.value = false                               // [H1]
-        runCatching { callSubs.values.forEach { it.cancel() } }; callSubs.clear()
-        timelineHandle = null; roomListResult = null; roomList = null
-        client = null; syncService = null; roomListService = null; timeline = null
-        currentRoom = null; currentRoomId = null; userId = ""; deviceId = ""
-        roomHandles.clear(); timelineItems.clear(); sendHandles.clear()
-        lastSeen.clear(); notifyArmed = false; activeCallRooms.clear()
-        rooms.value = emptyList(); messages.value = emptyList()
-        cachedBackupRoom = null                         // next account resolves its own library
-        wipeStore(ctx)                                  // remove crypto store too
-        status.value = ""
-    }
+    /** Clear local credentials first; server-device logout is bounded and best effort. */
+    suspend fun logout(ctx: Context) = duressWipe(ctx)
 
-    /** Duress / self-destruct wipe. Unlike [logout], this destroys ALL local session +
-     *  crypto state IMMEDIATELY and synchronously — NO network call first. Under coercion
-     *  the local data is the crown jewel and must be gone instantly (a blocking server
-     *  round-trip over Tor could hang, and a coercer must never see a "still working…"
-     *  spinner that hints a wipe is under way). The server-side device logout is fired
-     *  best-effort in the background and never blocks the wipe. Leaves the app looking like
-     *  a fresh install. See AppViewModel.duressWipe() for the full-device version. */
-    suspend fun duressWipe(ctx: Context) {
-        val doomed = client                             // keep a handle for the best-effort server logout
-        // 1) Local-first: tear down everything on disk + in memory, right now, no network.
-        runCatching { syncService?.stop() }
-        runCatching { timelineHandle?.cancel() }
-        runCatching { syncStateHandle?.cancel() }; syncStateHandle = null; syncRestartDelayMs = 0L
-        runCatching { clientDelegateHandle?.cancel() }; clientDelegateHandle = null
-        syncHardFailures = 0; authExpired.value = false
-        runCatching { callSubs.values.forEach { it.cancel() } }; callSubs.clear()
-        timelineHandle = null; roomListResult = null; roomList = null
-        client = null; syncService = null; roomListService = null; timeline = null
-        currentRoom = null; currentRoomId = null; userId = ""; deviceId = ""
-        roomHandles.clear(); timelineItems.clear(); sendHandles.clear()
-        lastSeen.clear(); notifyArmed = false; activeCallRooms.clear()
-        rooms.value = emptyList(); messages.value = emptyList()
-        cachedBackupRoom = null                         // next account resolves its own library
-        runCatching { sessionPrefs(ctx).edit().clear().apply() }
-        runCatching { ctx.getSharedPreferences(SESSION_OLD, Context.MODE_PRIVATE).edit().clear().apply() }
-        wipeStore(ctx)                                  // delete the crypto store (megolm keys etc.)
-        status.value = ""
-        // 2) Best-effort, background, non-blocking: ask the box to drop this device too.
-        scope.launch { runCatching { doomed?.logout() } }
+    /** Normal account sign-out. Emergency/full erasure uses Android's platform reset.
+     * Revoke credential callbacks and clear tokens before SDK or WebView work; serialize
+     * the remaining cleanup with authentication so it cannot erase a newer account. */
+    internal suspend fun duressWipe(
+        ctx: Context,
+        expectedOwner: SessionFence.Ticket? = null,
+        expired: Boolean = false,
+    ) {
+        val before = expectedOwner ?: sessionFence.capture()
+        logoutMutex.withLock {
+            var authJob: kotlinx.coroutines.Job? = null
+            val after = sessionFence.replaceIfCurrent(before) {
+                signingOut = true
+                authJob = activeAuthentication
+                activeAuthentication = null
+            } ?: return
+            authJob?.cancel(java.util.concurrent.CancellationException("Account signed out"))
+            withContext(NonCancellable) {
+                var cleaned = false
+                try {
+                    sessionFence.use(after) { clearStoredSession(ctx) }
+                    authenticationMutex.withLock {
+                        invalidateChatTimeline()
+                        ai.tournesol.privacybolt.AccountPrivacy.clearLocalAccess(ctx)
+                        closeBackupLibrary()
+                        agents.value = emptyMap()
+                        agentRooms.value = emptyList()
+                        agentWebui.value = null
+                        agentSessions.value = emptyMap()
+                        agentPrefs = null
+                        knownAgentIds.clear()
+                        consent.clear()
+                        val doomed = client                             // keep a handle for the best-effort server logout
+                        // Credentials were cleared before this bounded SDK shutdown.
+                        runCatching { kotlinx.coroutines.withTimeoutOrNull(5_000) { syncService?.stop() } }
+                        runCatching { timelineHandle?.cancel() }
+                        runCatching { syncStateHandle?.cancel() }; syncStateHandle = null; syncRestartDelayMs = 0L
+                        runCatching { clientDelegateHandle?.cancel() }; clientDelegateHandle = null
+                        syncHardFailures = 0; authExpired.value = false
+                        runCatching { callSubs.values.forEach { it.cancel() } }; callSubs.clear()
+                        timelineHandle = null; roomListResult = null; roomList = null
+                        client = null; clientOwner = null; syncService = null; roomListService = null; timeline = null
+                        currentRoom = null; currentRoomId = null; userId = ""; deviceId = ""
+                        roomHandles.clear(); timelineItems.clear(); sendHandles.clear()
+                        lastSeen.clear(); notifyArmed = false; activeCallRooms.clear()
+                        rooms.value = emptyList(); messages.value = emptyList()
+                        cachedBackupRoom = null                         // next account resolves its own library
+                        try {
+                            wipeStore(ctx)
+                            status.value = ""
+                        } finally {
+                            // Best effort server-device logout is independent of local I/O
+                            // success. The old client is closed even after a network timeout.
+                            scope.launch {
+                                try { kotlinx.coroutines.withTimeoutOrNull(10_000) { runCatching { doomed?.logout() } } }
+                                finally { runCatching { doomed?.close() } }
+                            }
+                        }
+                    }
+                    cleaned = true
+                } finally {
+                    sessionFence.use(after) {
+                        signingOut = false
+                        authExpired.value = expired && cleaned
+                    }
+                }
+            }
+        }
     }
 
     // --- Box config channel (appliance-UX feature B) ------------------------------------
@@ -2212,6 +2391,7 @@ object MatrixRepo {
         /** Private half of the onion's tor v3 client-auth keypair. Without it tor can't even
          *  resolve [onion] — so it travels with the address it unlocks. */
         val authKey: String = "",
+        val backend: String = "legacy",
     )
 
     /** Null until the box publishes an agent WebUI (i.e. until the add-on is installed). */
@@ -2233,12 +2413,14 @@ object MatrixRepo {
         val root = org.json.JSONObject(raw)
         // Where the agent's control UI lives, alongside the roster because it's the same
         // "what agents does this box run" answer. Its own onion, never the box's main one.
+        agentWebui.value = null
         root.optString("webui_onion").trim().takeIf { it.isNotEmpty() }?.let { onion ->
             agentWebui.value = AgentWebui(
                 onion = onion,
                 port = root.optInt("webui_port", 8788),
                 password = root.optString("webui_password").trim(),
                 authKey = root.optString("webui_auth_key").trim(),
+                backend = root.optString("backend", "legacy"),
             )
         }
         val arr = root.optJSONArray("agents") ?: return@runCatching emptyMap()
@@ -2541,14 +2723,6 @@ object MatrixRepo {
         return ChunkRef(f.substring(0, at), parts[0], idx, tot)
     }
 
-    /** Content-derived id so re-picking the SAME file after a failure resumes instead of
-     *  duplicating: identical name+size+mtime ⇒ identical id ⇒ existing parts are skipped. */
-    private fun fileIdFor(name: String, size: Long, modified: Long): String {
-        val md = java.security.MessageDigest.getInstance("SHA-256")
-        md.update("$name|$size|$modified".toByteArray())
-        return md.digest().take(8).joinToString("") { "%02x".format(it) }
-    }
-
     /** Serializes [ensureBackupRoom] so two concurrent openers (the app tile AND the screen's
      *  LaunchedEffect both fire) can't each pass the check-then-create and mint duplicate library
      *  rooms. Within the lock the account-data write of the first caller is visible to the second. */
@@ -2622,130 +2796,7 @@ object MatrixRepo {
             return false
         }
 
-        val room = runCatching { c.getRoom(roomId) }.getOrNull() ?: return false
-        val tl = runCatching { room.timeline() }.getOrNull() ?: return false
-        val dir = File(ctx.cacheDir, "pp_bk/${System.currentTimeMillis()}").apply { mkdirs() }
-        try {
-            // Small file: single attachment, byte-for-byte the shape we shipped before, so
-            // existing libraries and older readers keep working.
-            if (size <= CHUNK_THRESHOLD) {
-                val tmp = File(dir, name)
-                runCatching {
-                    cr.openInputStream(uri)?.use { i -> tmp.outputStream().use { o -> i.copyTo(o) } }
-                }
-                if (!tmp.exists() || tmp.length() == 0L) return false
-                val ok = sendOne(tl, tmp, mime)
-                if (ok) onProgress?.invoke(1, 1)
-                return ok   // single small attachment: the existing, proven path
-            }
-
-            // Chunked. Stable id => a retry resumes instead of duplicating.
-            val fileId = fileIdFor(name, size, queryModified(cr, uri))
-            val total = ((size + CHUNK_BYTES - 1) / CHUNK_BYTES).toInt()
-            val already = existingParts(roomId, fileId)
-            onProgress?.invoke(already.size, total)
-
-            cr.openInputStream(uri)?.use { input ->
-                val buf = ByteArray(256 * 1024)
-                var index = 0
-                while (index < total) {
-                    val want = minOf(CHUNK_BYTES, size - index * CHUNK_BYTES)
-                    if (index in already) {
-                        // Already on the box — skip its bytes without re-uploading them.
-                        var skipped = 0L
-                        while (skipped < want) {
-                            val n = input.skip(want - skipped)
-                            if (n <= 0) break
-                            skipped += n
-                        }
-                        index++
-                        continue
-                    }
-                    val part = File(dir, chunkName(name, fileId, index, total))
-                    var written = 0L
-                    part.outputStream().use { out ->
-                        while (written < want) {
-                            val n = input.read(buf, 0, minOf(buf.size.toLong(), want - written).toInt())
-                            if (n <= 0) break
-                            out.write(buf, 0, n); written += n
-                        }
-                    }
-                    if (written <= 0L) { part.delete(); return false }
-                    val ok = sendOne(tl, part, mime)
-                    part.delete()          // one chunk on disk at a time, never a full copy
-                    if (!ok) return false  // stop here; the parts already sent let us resume
-                    // Confirm it actually LEFT the phone before counting it or moving on, so
-                    // progress is real and "Backed up" isn't announced mid-upload.
-                    if (!awaitPartSent(fileId, index)) return false
-                    index++
-                    onProgress?.invoke(existingParts(roomId, fileId).size, total)
-                }
-            } ?: return false
-            return true
-        } finally {
-            runCatching { dir.deleteRecursively() }
-        }
-    }
-
-    private suspend fun sendOne(
-        tl: org.matrix.rustcomponents.sdk.Timeline,
-        file: File,
-        mime: String,
-    ): Boolean {
-        val params = org.matrix.rustcomponents.sdk.UploadParameters(
-            org.matrix.rustcomponents.sdk.UploadSource.File(file.absolutePath), null, null, null, null,
-        )
-        val info = org.matrix.rustcomponents.sdk.FileInfo(mime, file.length().toULong(), null, null)
-        return runCatching { tl.sendFile(params, info).join(); true }.getOrDefault(false)
-    }
-
-    /** Chunk indexes of [fileId] that are actually ON THE BOX (fully sent) — the basis of both
-     *  resume and honest progress. Deliberately excludes still-queued parts: counting those
-     *  would let us skip a chunk that never made it, leaving a permanently broken file. */
-    private fun existingParts(roomId: String, fileId: String): Set<Int> {
-        val out = HashSet<Int>()
-        synchronized(libItems) {
-            for ((ref, sending) in projectChunkRefs(libItems)) {
-                if (ref.fileId == fileId && !sending) out.add(ref.index)
-            }
-        }
-        return out
-    }
-
-    /**
-     * Wait until chunk [index] of [fileId] has genuinely left the phone.
-     *
-     * `sendFile(...).join()` returns once the send is QUEUED locally, not once it's uploaded —
-     * so without this the loop races through all chunks in seconds, reports "Backed up", and
-     * leaves the file still uploading in the background. That's exactly the lie this feature
-     * exists to remove, so every chunk is confirmed sent before we move to the next one.
-     * Returns false on timeout, which aborts the upload and leaves the sent parts for a resume.
-     */
-    private suspend fun awaitPartSent(fileId: String, index: Int, timeoutMs: Long = 20 * 60_000L): Boolean {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
-            if (index in existingParts("", fileId)) return true
-            kotlinx.coroutines.delay(1000)
-        }
-        return false
-    }
-
-    /** Chunk refs in the library timeline, each with whether it is still being sent. */
-    private fun projectChunkRefs(items: List<TimelineItem>): List<Pair<ChunkRef, Boolean>> {
-        val out = ArrayList<Pair<ChunkRef, Boolean>>()
-        for (item in items) {
-            val ev = runCatching { item.asEvent() }.getOrNull() ?: continue
-            val content = ev.content as? TimelineItemContent.MsgLike ?: continue
-            val kind = content.content.kind as? MsgLikeKind.Message ?: continue
-            val fn = when (val mt = kind.content.msgType) {
-                is org.matrix.rustcomponents.sdk.MessageType.File -> mt.content.filename
-                is org.matrix.rustcomponents.sdk.MessageType.Image -> mt.content.filename
-                else -> null
-            }
-            val sending = runCatching { ev.localSendState != null }.getOrDefault(false)
-            parseChunkName(fn)?.let { out.add(it to sending) }
-        }
-        return out
+        return BackupTransfer.upload(c, ctx, roomId, uri, name, mime, size, { client === c && isLoggedIn }, onProgress)
     }
 
     private fun queryLength(cr: android.content.ContentResolver, uri: android.net.Uri): Long =
@@ -2787,12 +2838,21 @@ object MatrixRepo {
             return true
         }
         if (!f.complete || f.parts.size < f.partsTotal) return false   // never truncate
+        val hash = java.security.MessageDigest.getInstance("SHA-256")
+        var written = 0L
         for ((i, src) in f.parts.withIndex()) {
             val bytes = runCatching { c.getMediaContent(src) }.getOrNull() ?: return false
             out.write(bytes)
+            hash.update(bytes)
+            written += bytes.size
             onProgress?.invoke(i + 1, f.partsTotal)
         }
         out.flush()
+        if (written != f.sizeBytes) return false
+        if (f.key.startsWith("chunked:sha256-")) {
+            val expected = f.key.removePrefix("chunked:sha256-")
+            if (hash.digest().joinToString("") { "%02x".format(it) } != expected) return false
+        }
         return true
     }
 
@@ -2819,6 +2879,8 @@ object MatrixRepo {
     /** Contents of the backup library, newest first. A DEDICATED timeline (own handle + list)
      *  so browsing files never disturbs whatever chat is open. */
     val backupFiles = MutableStateFlow<List<BackupFile>>(emptyList())
+    val libraryHasMore = MutableStateFlow(true)
+    val libraryLoadingMore = MutableStateFlow(false)
     private var libTimeline: org.matrix.rustcomponents.sdk.Timeline? = null
     private var libHandle: org.matrix.rustcomponents.sdk.TaskHandle? = null
     private val libItems = ArrayList<TimelineItem>()
@@ -2852,7 +2914,18 @@ object MatrixRepo {
                 }
             }
         })
-        runCatching { tl.paginateBackwards(200u.toUShort()) }
+        libraryHasMore.value = true
+        loadMoreBackupFiles()
+    }
+
+    suspend fun loadMoreBackupFiles() {
+        if (libraryLoadingMore.value || !libraryHasMore.value) return
+        val current = libTimeline ?: return
+        libraryLoadingMore.value = true
+        try {
+            val reachedStart = current.paginateBackwards(200u.toUShort())
+            if (libTimeline === current) libraryHasMore.value = !reachedStart
+        } finally { libraryLoadingMore.value = false }
     }
 
     fun closeBackupLibrary() {
@@ -2875,7 +2948,7 @@ object MatrixRepo {
             val key = runCatching { ev.eventOrTransactionId.toString() }
                 .getOrDefault("bk:${System.identityHashCode(item)}")
             val ts = runCatching { ev.timestamp.toLong() }.getOrDefault(0L)
-            val sending = runCatching { ev.localSendState != null }.getOrDefault(false)
+            val sending = runCatching { ev.localSendState != null && ev.localSendState !is EventSendState.Sent }.getOrDefault(true)
             var name: String? = null; var mime: String? = null; var size = 0L
             var isImage = false; var media: org.matrix.rustcomponents.sdk.MediaSource? = null
             when (val mt = mc.msgType) {
@@ -2951,12 +3024,17 @@ object MatrixRepo {
 
     /** Poll the box's result for [id]: null = not done yet, true/false = ok/failed. */
     /** Command outcome WITH the box's own wording — the update flow shows the box's message
-     *  ("updated to 0.1.3 — your box is restarting") or its refusal verbatim, rather than
+     *  ("updated to 0.1.3 — Lodge is restarting") or its refusal verbatim, rather than
      *  guessing on the phone. Null until the box has answered THIS command id. */
     data class CommandOutcome(val ok: Boolean, val message: String?)
 
     suspend fun readCommandOutcome(id: String): CommandOutcome? = runCatching {
-        val raw = client?.accountData(COMMAND_RESULT_TYPE)
+        val c = client ?: return@runCatching null
+        val suffix = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(id.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+        val raw = runCatching { c.accountData("$COMMAND_RESULT_TYPE.$suffix") }.getOrNull()
+            ?.takeIf { it.isNotBlank() && it != "{}" }
+            ?: c.accountData(COMMAND_RESULT_TYPE)
         if (raw.isNullOrBlank()) return@runCatching null
         val o = org.json.JSONObject(raw)
         if (o.optString("id") != id) return@runCatching null
@@ -2970,13 +3048,7 @@ object MatrixRepo {
         CommandOutcome(ok, (if (ok) o.optString("message") else o.optString("error")).ifBlank { null })
     }.getOrNull()
 
-    suspend fun readCommandResult(id: String): Boolean? = runCatching {
-        val raw = client?.accountData(COMMAND_RESULT_TYPE)
-        if (raw.isNullOrBlank()) return@runCatching null
-        val o = org.json.JSONObject(raw)
-        if (o.optString("id") != id) return@runCatching null
-        o.optBoolean("ok", false)
-    }.getOrNull()
+    suspend fun readCommandResult(id: String): Boolean? = readCommandOutcome(id)?.ok
 
     /**
      * Interim progress for a long-running command, distinct from [readCommandOutcome],

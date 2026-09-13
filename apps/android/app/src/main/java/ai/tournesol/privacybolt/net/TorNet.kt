@@ -54,6 +54,8 @@ object TorNet {
         val b = OkHttpClient.Builder()
             .proxy(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", httpProxyPort)))
             .retryOnConnectionFailure(true)
+            .followRedirects(false)
+            .followSslRedirects(false)
         if (trustAllCerts) {
             b.sslSocketFactory(trustAllCtx().socketFactory, trustAll[0] as X509TrustManager)
                 .hostnameVerifier { _, _ -> true }
@@ -61,9 +63,27 @@ object TorNet {
         return b.build()
     }
 
-    private fun isOnion(s: String) = s.contains(".onion")
+    private fun isOnion(s: String): Boolean {
+        val uri = runCatching { java.net.URI(s) }.getOrNull() ?: return false
+        return uri.scheme in setOf("http", "https") && uri.userInfo == null
+            && uri.host?.matches(Regex("[a-z2-7]{56}\\.onion")) == true
+    }
 
-    private val started = HashMap<Int, Any>()
+    private val started = java.util.concurrent.ConcurrentHashMap<Int, Any>()
+    private val activeSockets = java.util.concurrent.ConcurrentHashMap<Int, MutableSet<Socket>>()
+    private fun track(port: Int, owner: ServerSocket, socket: Socket): Boolean = synchronized(this) {
+        // A port may already have been reopened for a new call/account. Only its
+        // original listener may register a connection, including pending SOCKS handshakes.
+        if (started[port] !== owner) { socket.close(); return false }
+        activeSockets.getOrPut(port) { HashSet() }.add(socket)
+        true
+    }
+
+    private class HttpProxy(val server: NanoHTTPD, val client: OkHttpClient) {
+        @Volatile var stopped = false
+        var listener: ServerSocket? = null
+        val calls = java.util.concurrent.ConcurrentHashMap.newKeySet<okhttp3.Call>()
+    }
 
     /** One-shot GET of an onion URL over Tor, with response-body rewrites — used by
      *  the WebView's shouldInterceptRequest to serve .onion requests Chromium would
@@ -83,12 +103,18 @@ object TorNet {
      *  rewriting `rewrites` in response bodies. If [injectHtml] is set, it is inserted
      *  into HTML responses (right after <head>) — used to patch the Element Call app
      *  in-page (e.g. force WebRTC media through a localhost TURN bridge over Tor). */
-    fun startHttpProxy(localPort: Int, onionBase: String, httpProxyPort: Int, rewrites: Map<String, String>, injectHtml: String? = null) {
+    @Synchronized fun startHttpProxy(localPort: Int, onionBase: String, httpProxyPort: Int, rewrites: Map<String, String>, injectHtml: String? = null) {
         if (started.containsKey(localPort)) return
         // CA-validate clearnet (call.element.io); trust-all only for the self-signed onion.
         val client = torClient(httpProxyPort, isOnion(onionBase))
+        lateinit var proxy: HttpProxy
         val server = object : NanoHTTPD("127.0.0.1", localPort) {
             override fun serve(session: IHTTPSession): Response {
+                if (proxy.stopped) return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Call connection closed")
+                val origin = session.headers["origin"]
+                val expected = "http://127.0.0.1:${ai.tournesol.privacybolt.ElementCallActivity.EC_LOCAL}"
+                if ((origin != null && origin != expected) || session.headers["sec-fetch-site"] == "cross-site")
+                    return newFixedLengthResponse(Response.Status.FORBIDDEN, "text/plain", "Untrusted origin")
                 if (session.method == Method.OPTIONS) {
                     val r = newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", ""); cors(r); return r
                 }
@@ -109,8 +135,13 @@ object TorNet {
                     var upstreamErr: java.io.IOException? = null
                     var built: Response? = null
                     for (attempt in 1..UPSTREAM_ATTEMPTS) {
+                      if (proxy.stopped) throw java.io.IOException("Connection closed")
                       try {
-                        built = client.newCall(builtReq).execute().use { resp ->
+                        val call = synchronized(this@TorNet) {
+                            if (proxy.stopped) throw java.io.IOException("Connection closed")
+                            client.newCall(builtReq).also { proxy.calls.add(it) }
+                        }
+                        built = try { call.execute().use { resp ->
                         Log.i(TAG, "  upstream ${session.uri} -> ${resp.code}")
                         val ctType = resp.header("content-type") ?: "application/octet-stream"
                         val status = object : Response.IStatus {
@@ -134,18 +165,23 @@ object TorNet {
                             val bytes = resp.body?.bytes() ?: ByteArray(0)
                             newFixedLengthResponse(status, ctType, java.io.ByteArrayInputStream(bytes), bytes.size.toLong())
                         }
+                        val perCallHtml = injectHtml != null && ctType.contains("html")
                         resp.headers.forEach { (k, v) ->
                             val lk = k.lowercase()
                             // strip CSP / framing / CORP so the localhost-served EC can
                             // frame + connect to our other localhost bridges.
-                            if (lk !in HOP && lk != "content-type" && !lk.startsWith("access-control-") &&
+                            if (!(perCallHtml && lk in setOf("cache-control", "etag", "last-modified", "expires")) &&
+                                lk !in HOP && lk != "content-type" && !lk.startsWith("access-control-") &&
                                 lk != "content-security-policy" && lk != "content-security-policy-report-only" &&
                                 lk != "x-frame-options" && lk != "cross-origin-embedder-policy" &&
                                 lk != "cross-origin-opener-policy" && lk != "cross-origin-resource-policy"
                             ) out.addHeader(k, v)
                         }
+                        // The transformed HTML contains this call's media policy and
+                        // bridge configuration, not the upstream cacheable document.
+                        if (perCallHtml) out.addHeader("Cache-Control", "no-store")
                         cors(out); out
-                        }
+                        } } finally { proxy.calls.remove(call) }
                         break
                       } catch (io: java.io.IOException) {
                         upstreamErr = io
@@ -156,19 +192,25 @@ object TorNet {
                     built ?: throw (upstreamErr ?: java.io.IOException("upstream unreachable"))
                 } catch (t: Throwable) {
                     Log.e(TAG, "proxy $localPort error", t)
-                    newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "err:${t.message}")
+                    newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Box connection unavailable")
                 }
             }
         }
-        server.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
-        started[localPort] = server
+        proxy = HttpProxy(server, client)
+        server.serverSocketFactory = NanoHTTPD.ServerSocketFactory {
+            ServerSocket().also { proxy.listener = it }
+        }
+        try { server.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false) }
+        catch (error: Exception) { proxy.stopped = true; closeListener(proxy); throw error }
+        started[localPort] = proxy
         Log.i(TAG, "http proxy 127.0.0.1:$localPort -> $onionBase  rewrites=${rewrites.size}")
     }
 
     /** Plain-TCP local listener (ws://127.0.0.1:localPort) bridged to the onion's
      *  wss endpoint: accept plaintext, open a TLS connection to onion:port over Tor
      *  SOCKS5 (domain => remote DNS), and pipe. Carries the SFU WebSocket. */
-    fun startTlsForwarder(localPort: Int, onionHost: String, onionPort: Int, socksPort: Int) {
+    @Synchronized fun startTlsForwarder(localPort: Int, onionHost: String, onionPort: Int, socksPort: Int) {
+        require(onionHost.matches(Regex("[a-z2-7]{56}\\.onion")))
         if (started.containsKey(localPort)) return
         val ss = ServerSocket(); ss.reuseAddress = true
         ss.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), localPort))
@@ -176,7 +218,7 @@ object TorNet {
         thread(name = "fwd-$localPort") {
             while (!ss.isClosed) {
                 val client = try { ss.accept() } catch (_: Throwable) { break }
-                thread { bridge(client, onionHost, onionPort, socksPort) }
+                if (track(localPort, ss, client)) thread { bridge(client, onionHost, onionPort, socksPort, localPort, ss) }
             }
         }
         Log.i(TAG, "tls forwarder ws 127.0.0.1:$localPort -> wss $onionHost:$onionPort")
@@ -187,7 +229,7 @@ object TorNet {
      *  destination onion is resolved per-connection via [host] — the joiner only
      *  learns the call's focus box (where coturn lives) after the call state arrives,
      *  so we point this at it dynamically. */
-    fun startTcpForwarder(localPort: Int, host: () -> String, onionPort: Int, socksPort: Int) {
+    @Synchronized fun startTcpForwarder(localPort: Int, host: () -> String, onionPort: Int, socksPort: Int) {
         if (started.containsKey(localPort)) return
         val ss = ServerSocket(); ss.reuseAddress = true
         ss.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), localPort))
@@ -195,7 +237,7 @@ object TorNet {
         thread(name = "tcpfwd-$localPort") {
             while (!ss.isClosed) {
                 val client = try { ss.accept() } catch (_: Throwable) { break }
-                thread { tcpBridge(client, host(), onionPort, socksPort) }
+                if (track(localPort, ss, client)) thread { tcpBridge(client, host, onionPort, socksPort, localPort, ss) }
             }
         }
         Log.i(TAG, "tcp forwarder 127.0.0.1:$localPort -> :$onionPort (dynamic onion)")
@@ -204,15 +246,46 @@ object TorNet {
     /** Tear down every local bridge/forwarder started for a call. Called when the
      *  call activity is destroyed so the loopback listeners + their Tor circuits
      *  don't linger (and so the next call starts them fresh). */
-    fun stopAll() {
-        val items = synchronized(started) { val v = started.values.toList(); started.clear(); v }
-        for (v in items) runCatching {
-            when (v) {
-                is NanoHTTPD -> v.stop()
-                is ServerSocket -> v.close()
-            }
+    fun stopPort(port: Int) {
+        val (item, sockets) = synchronized(this) {
+            val item = started.remove(port)
+            if (item is HttpProxy) item.stopped = true
+            item to activeSockets.remove(port)?.toList().orEmpty()
         }
+        sockets.forEach { runCatching { it.close() } }
+        closeListener(item)
+    }
+
+    fun stopAll() {
+        val (items, sockets) = synchronized(this) {
+            val items = started.values.toList()
+            items.filterIsInstance<HttpProxy>().forEach { it.stopped = true }
+            started.clear()
+            val sockets = activeSockets.values.flatMap { it.toList() }
+            activeSockets.clear()
+            items to sockets
+        }
+        sockets.forEach { runCatching { it.close() } }
+        items.forEach { closeListener(it) }
         Log.i(TAG, "stopAll: tore down ${items.size} bridges")
+    }
+
+    private fun closeListener(item: Any?) {
+        when (item) {
+            is HttpProxy -> {
+                // Release the listening port before any pooled upstream cleanup can fail.
+                // Connected-socket cleanup runs off Android's main thread; a StrictMode
+                // exception must never skip stopping the HTTP listener for the next call.
+                runCatching { item.listener?.close() }
+                thread(name = "call-proxy-cleanup", isDaemon = true) {
+                    runCatching { item.server.stop() }
+                    item.calls.forEach { runCatching { it.cancel() } }
+                    runCatching { item.client.dispatcher.cancelAll() }
+                    runCatching { item.client.connectionPool.evictAll() }
+                }
+            }
+            is ServerSocket -> runCatching { item.close() }
+        }
     }
 
     /** Pre-build the Tor circuit to an onion service so the first real connection
@@ -237,39 +310,65 @@ object TorNet {
         }
     }
 
-    private fun tcpBridge(client: Socket, host: String, port: Int, socksPort: Int) {
+    private fun tcpBridge(client: Socket, host: () -> String, port: Int, socksPort: Int, localPort: Int, owner: ServerSocket) {
+        var raw: Socket? = null
         try {
-            val raw = socks5(host, port, socksPort)
-            val t1 = thread { copy(client.getInputStream(), raw.getOutputStream()) }
-            copy(raw.getInputStream(), client.getOutputStream())
-            t1.join(200); client.close(); raw.close()
-        } catch (t: Throwable) { Log.d(TAG, "tcp bridge ended: ${t.message}"); runCatching { client.close() } }
+            val remote = socks5(host(), port, socksPort) { raw = it; track(localPort, owner, it) }
+            if (client.isClosed) return
+            val t1 = thread { copy(client.getInputStream(), remote.getOutputStream()); runCatching { remote.shutdownOutput() } }
+            copy(remote.getInputStream(), client.getOutputStream())
+            t1.join(200)
+        } catch (_: java.io.IOException) {
+            // Closed bridge / unavailable circuit; no credential-bearing diagnostics.
+        } finally {
+            runCatching { client.close() }; runCatching { raw?.close() }
+            synchronized(this) { activeSockets[localPort]?.remove(client); raw?.let { activeSockets[localPort]?.remove(it) } }
+        }
     }
 
-    private fun bridge(client: Socket, host: String, port: Int, socksPort: Int) {
+    private fun bridge(client: Socket, host: String, port: Int, socksPort: Int, localPort: Int, owner: ServerSocket) {
+        var raw: Socket? = null
+        var tls: SSLSocket? = null
         try {
-            val raw = socks5(host, port, socksPort)
-            val tls = trustAllCtx().socketFactory.createSocket(raw, host, port, true) as SSLSocket
+            raw = socks5(host, port, socksPort) { raw = it; track(localPort, owner, it) }
+            tls = trustAllCtx().socketFactory.createSocket(raw, host, port, true) as SSLSocket
+            tls.soTimeout = 60_000
             tls.startHandshake()
-            val t1 = thread { copy(client.getInputStream(), tls.getOutputStream()) }
+            tls.soTimeout = 0
+            val remote = tls
+            val t1 = thread { copy(client.getInputStream(), remote.getOutputStream()) }
             copy(tls.getInputStream(), client.getOutputStream())
-            t1.join(200); client.close(); tls.close()
-        } catch (t: Throwable) { Log.d(TAG, "bridge ended: ${t.message}"); runCatching { client.close() } }
+            t1.join(200)
+        } catch (_: java.io.IOException) {
+            // Unavailable/closed circuit. Do not include private endpoints in errors.
+        } finally {
+            runCatching { client.close() }; runCatching { tls?.close() }; runCatching { raw?.close() }
+            synchronized(this) { activeSockets[localPort]?.remove(client); raw?.let { activeSockets[localPort]?.remove(it) } }
+        }
     }
 
-    private fun socks5(host: String, port: Int, socksPort: Int): Socket {
-        val tor = Socket(); tor.connect(InetSocketAddress("127.0.0.1", socksPort), 15000)
+    private fun socks5(host: String, port: Int, socksPort: Int, register: (Socket) -> Boolean = { true }): Socket {
+        val tor = Socket()
+        try {
+        if (!register(tor)) throw java.io.IOException("Connection closed")
+        tor.soTimeout = 60_000
+        tor.connect(InetSocketAddress("127.0.0.1", socksPort), 15000)
         val ti = tor.getInputStream(); val to = tor.getOutputStream()
-        to.write(byteArrayOf(5, 1, 0)); to.flush(); readFully(ti, ByteArray(2), 2)
+        to.write(byteArrayOf(5, 1, 0)); to.flush()
+        val greeting = ByteArray(2); readFully(ti, greeting, 2)
+        if (greeting[0].toInt() != 5 || greeting[1].toInt() != 0) throw java.io.IOException("SOCKS authentication unavailable")
         val h = host.toByteArray(); val req = ByteArrayOutputStream()
+        if (h.isEmpty() || h.size > 255 || port !in 1..65535) throw java.io.IOException("Invalid destination")
         req.write(byteArrayOf(5, 1, 0, 3)); req.write(h.size); req.write(h)
         req.write((port ushr 8) and 0xff); req.write(port and 0xff)
         to.write(req.toByteArray()); to.flush()
         val head = ByteArray(4); readFully(ti, head, 4)
-        if (head[1].toInt() != 0) throw java.io.IOException("socks connect failed ${head[1]}")
-        val skip = when (head[3].toInt()) { 1 -> 6; 4 -> 18; 3 -> { val l = ByteArray(1); readFully(ti, l, 1); (l[0].toInt() and 0xff) + 2 }; else -> 0 }
+        if (head[0].toInt() != 5 || head[1].toInt() != 0 || head[2].toInt() != 0) throw java.io.IOException("SOCKS connection failed")
+        val skip = when (head[3].toInt()) { 1 -> 6; 4 -> 18; 3 -> { val l = ByteArray(1); readFully(ti, l, 1); (l[0].toInt() and 0xff) + 2 }; else -> throw java.io.IOException("Invalid SOCKS reply") }
         if (skip > 0) readFully(ti, ByteArray(skip), skip)
+        tor.soTimeout = 0
         return tor
+        } catch (t: Throwable) { runCatching { tor.close() }; throw t }
     }
 
     private fun copy(inp: java.io.InputStream, out: java.io.OutputStream) {
@@ -280,7 +379,8 @@ object TorNet {
         var off = 0; while (off < n) { val r = inp.read(b, off, n - off); if (r < 0) throw java.io.EOFException(); off += r }
     }
     private fun cors(r: NanoHTTPD.Response) {
-        r.addHeader("Access-Control-Allow-Origin", "*")
+        r.addHeader("Access-Control-Allow-Origin", "http://127.0.0.1:${ai.tournesol.privacybolt.ElementCallActivity.EC_LOCAL}")
+        r.addHeader("Vary", "Origin")
         r.addHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         r.addHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
         // Chromium Private Network Access: a secure public page (call.element.io)

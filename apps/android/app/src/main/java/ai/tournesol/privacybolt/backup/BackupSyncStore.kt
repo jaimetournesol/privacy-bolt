@@ -58,6 +58,16 @@ object BackupSyncStore {
     private fun prefs(ctx: Context): SharedPreferences =
         ctx.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
+    @Synchronized
+    fun clearAccount(ctx: Context) {
+        prefs(ctx).edit().clear().commit()
+        loaded = false
+        _sources.value = emptyList()
+        _lastSyncMs.value = 0
+        _wifiOnly.value = true
+        _batteryNotLow.value = true
+    }
+
     /** Load once into the flows. Safe to call repeatedly (idempotent). */
     @Synchronized
     fun ensureLoaded(ctx: Context) {
