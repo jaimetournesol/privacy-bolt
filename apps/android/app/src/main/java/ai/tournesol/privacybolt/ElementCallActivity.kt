@@ -83,9 +83,11 @@ class ElementCallActivity : ComponentActivity() {
     // PUBLISH to the room carries the real onion focus, not our private bridge URL —
     // otherwise the peer reads "127.0.0.1" and points at its own box).
     private val ecReverse: MutableMap<String, String> = java.util.concurrent.ConcurrentHashMap()
-    // call focus onions we've already started peer bridges for (the joiner connects
-    // to the CALL's focus box, which for a cross-install call is the peer's box).
-    private val peerFocusStarted = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val peerFocusRoutes = CallFocusRoutes(JWT_PEER, SFU_PEER, 16,
+        connectAuth = { port, host -> TorNet.startHttpProxy(port, "https://$host:8443", TorManager.HTTP_PORT, ecRewrites) },
+        connectMedia = { port, host -> TorNet.startTlsForwarder(port, host, 7443, TorManager.SOCKS_PORT) },
+        disconnect = { port -> TorNet.stopPort(port) },
+    )
     private val focusRe = Regex("(?:wss://|https://)([a-z2-7]{56}\\.onion):(?:7443|8443)")
     // Publisher and receiver can use different focus boxes concurrently. Keep
     // every TURN destination immutable rather than retargeting one shared port.
@@ -132,6 +134,10 @@ class ElementCallActivity : ComponentActivity() {
         callStartMs = android.os.SystemClock.elapsedRealtime()
         // Block screenshots / screen-recording of the call surface (release only).
         applyScreenSecurity()
+        if (AccountPrivacy.gate.value != Gate.Open) { finish(); return }
+        lifecycleScope.launch {
+            AccountPrivacy.gate.collect { if (it != Gate.Open) finish() }
+        }
         val room = MatrixRepo.currentRoom
         if (room == null) { Log.w(TAG, "no current room — finishing"); finish(); return }
         callRoomId = runCatching { room.id() }.getOrNull()
@@ -249,6 +255,7 @@ class ElementCallActivity : ComponentActivity() {
         // call makes NO clearnet request at all.
 
         web = WebView(this).apply {
+            AccountWebViews.register(this)
             settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
@@ -587,25 +594,22 @@ class ElementCallActivity : ComponentActivity() {
         for (m in focusRe.findAll(msg)) {
             val host = m.groupValues[1]
             if (host == ecOnion) continue
-            if (!peerFocusStarted.add(host)) continue
-            Log.i(TAG, "discovered peer focus onion $host -> starting peer bridges")
-            runCatching {
-                TorNet.startHttpProxy(JWT_PEER, "https://$host:8443", TorManager.HTTP_PORT, ecRewrites)
-                TorNet.startTlsForwarder(SFU_PEER, host, 7443, TorManager.SOCKS_PORT)
-                // Pre-build the circuit to the peer focus so the first JWT/SFU hop to it
-                // doesn't race a cold circuit (same cold-onion fix as the own-box prewarm).
-                TorNet.prewarm(host, 8443, TorManager.SOCKS_PORT)   // peer lk-jwt
-                TorNet.prewarm(host, 7443, TorManager.SOCKS_PORT)   // peer LiveKit SFU
-            }.onFailure { Log.e(TAG, "peer bridge start failed", it) }
+            val fresh = !ecRewrites.containsKey("https://$host:8443")
+            val route = try { peerFocusRoutes.routeFor(host) }
+            catch (_: Exception) { Log.w(TAG, "Peer call bridge could not start"); continue }
+            if (fresh) {
+                TorNet.prewarm(host, 8443, TorManager.SOCKS_PORT)
+                TorNet.prewarm(host, 7443, TorManager.SOCKS_PORT)
+            }
             // NB: we deliberately do NOT set turnOnion here. A foci_preferred in a
             // member's state is only a *candidate* focus, not the one this call landed
             // on — stale memberships would point the TURN relay at the wrong box. The
             // authoritative focus comes from the turn:<onion> EC actually requests,
             // reported via Bridge.setTurnOnion (the injected ICE patch).
-            ecRewrites["https://$host:8443"] = "http://127.0.0.1:$JWT_PEER"
-            ecRewrites["wss://$host:7443"] = "ws://127.0.0.1:$SFU_PEER"
-            ecReverse["http://127.0.0.1:$JWT_PEER"] = "https://$host:8443"
-            ecReverse["ws://127.0.0.1:$SFU_PEER"] = "wss://$host:7443"
+            ecRewrites["https://$host:8443"] = "http://127.0.0.1:${route.authPort}"
+            ecRewrites["wss://$host:7443"] = "ws://127.0.0.1:${route.mediaPort}"
+            ecReverse["http://127.0.0.1:${route.authPort}"] = "https://$host:8443"
+            ecReverse["ws://127.0.0.1:${route.mediaPort}"] = "wss://$host:7443"
         }
     }
 
@@ -717,10 +721,11 @@ class ElementCallActivity : ComponentActivity() {
         // sees a ghost participant that makes Element Call refuse new calls. Runs on
         // the repo's app-scope (survives this activity) over the SDK's own Tor path.
         callRoomId?.let { MatrixRepo.clearMyCallMembership(it) }
-        runCatching { web.destroy() }
+        if (::web.isInitialized) AccountWebViews.close(web)
         // Tear down the per-call Tor bridges/forwarders so they don't linger.
         turnRoutes.close()
-        listOf(EC_LOCAL, HS_LOCAL, JWT_LOCAL, SFU_LOCAL, JWT_PEER, SFU_PEER)
+        peerFocusRoutes.close()
+        listOf(EC_LOCAL, HS_LOCAL, JWT_LOCAL, SFU_LOCAL)
             .forEach { runCatching { TorNet.stopPort(it) } }
     }
 }

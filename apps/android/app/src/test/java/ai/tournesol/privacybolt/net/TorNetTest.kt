@@ -42,7 +42,8 @@ class TorNetTest {
     @Test fun httpListenerClosesAndImmediatelyReopensWithActiveBrowserConnection() {
         val local = port()
         repeat(3) {
-            TorNet.startHttpProxy(local, "http://$onion", port(), emptyMap())
+            try { TorNet.startHttpProxy(local, "http://$onion", port(), emptyMap()) }
+            catch (e: java.net.BindException) { throw AssertionError("initial bind, iteration $it", e) }
             Socket("127.0.0.1", local).use { browser ->
                 browser.soTimeout = 3000
                 // An idle keep-alive browser connection must not retain the listening port.
@@ -52,7 +53,8 @@ class TorNetTest {
                 while (!reader.readLine().isNullOrEmpty()) { }
                 TorNet.stopPort(local)
                 // Binding must succeed immediately, before asynchronous pool cleanup ends.
-                TorNet.startHttpProxy(local, "http://$onion", port(), emptyMap())
+                try { TorNet.startHttpProxy(local, "http://$onion", port(), emptyMap()) }
+                catch (e: java.net.BindException) { throw AssertionError("rebind with active browser, iteration $it", e) }
                 assertEquals(-1, reader.read())
                 TorNet.stopPort(local)
             }

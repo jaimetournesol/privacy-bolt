@@ -54,6 +54,7 @@ object TorManager {
 
     suspend fun start(ctx: Context) {
         transition.withLock {
+            if (ctx.getSharedPreferences("pp_app", Context.MODE_PRIVATE).getBoolean("paused", false)) return
             synchronized(lifecycleLock) {
                 if (readerJob?.isActive == true) return
                 val gen = ++generation
@@ -139,8 +140,10 @@ object TorManager {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (t: Throwable) {
-            Log.e(TAG, "tor start failed", t)
-            setState(State.Failed(t.message ?: t.toString()))
+            if (gen == generation) {
+                Log.e(TAG, "Tor failed: ${t.javaClass.simpleName}")
+                setState(State.Failed("Private network stopped. Tap retry to reconnect."))
+            }
         } finally {
             withContext(NonCancellable + Dispatchers.IO) {
                 ownedProcess?.let { stopAndReap(it) }

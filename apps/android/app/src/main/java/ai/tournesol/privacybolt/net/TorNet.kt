@@ -71,6 +71,7 @@ object TorNet {
 
     private val started = java.util.concurrent.ConcurrentHashMap<Int, Any>()
     private val activeSockets = java.util.concurrent.ConcurrentHashMap<Int, MutableSet<Socket>>()
+    private val acceptThreads = java.util.concurrent.ConcurrentHashMap<ServerSocket, Thread>()
     private fun track(port: Int, owner: ServerSocket, socket: Socket): Boolean = synchronized(this) {
         // A port may already have been reopened for a new call/account. Only its
         // original listener may register a connection, including pending SOCKS handshakes.
@@ -82,6 +83,7 @@ object TorNet {
     private class HttpProxy(val server: NanoHTTPD, val client: OkHttpClient) {
         @Volatile var stopped = false
         var listener: ServerSocket? = null
+        val listenerStopped = java.util.concurrent.CountDownLatch(1)
         val calls = java.util.concurrent.ConcurrentHashMap.newKeySet<okhttp3.Call>()
     }
 
@@ -109,6 +111,11 @@ object TorNet {
         val client = torClient(httpProxyPort, isOnion(onionBase))
         lateinit var proxy: HttpProxy
         val server = object : NanoHTTPD("127.0.0.1", localPort) {
+            override fun createServerRunnable(timeout: Int): ServerRunnable = object : ServerRunnable(timeout) {
+                override fun run() {
+                    try { super.run() } finally { proxy.listenerStopped.countDown() }
+                }
+            }
             override fun serve(session: IHTTPSession): Response {
                 if (proxy.stopped) return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Call connection closed")
                 val origin = session.headers["origin"]
@@ -215,12 +222,12 @@ object TorNet {
         val ss = ServerSocket(); ss.reuseAddress = true
         ss.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), localPort))
         started[localPort] = ss
-        thread(name = "fwd-$localPort") {
+        thread(start = false, name = "fwd-$localPort") {
             while (!ss.isClosed) {
                 val client = try { ss.accept() } catch (_: Throwable) { break }
                 if (track(localPort, ss, client)) thread { bridge(client, onionHost, onionPort, socksPort, localPort, ss) }
             }
-        }
+        }.also { acceptThreads[ss] = it; it.start() }
         Log.i(TAG, "tls forwarder ws 127.0.0.1:$localPort -> wss $onionHost:$onionPort")
     }
 
@@ -234,12 +241,12 @@ object TorNet {
         val ss = ServerSocket(); ss.reuseAddress = true
         ss.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), localPort))
         started[localPort] = ss
-        thread(name = "tcpfwd-$localPort") {
+        thread(start = false, name = "tcpfwd-$localPort") {
             while (!ss.isClosed) {
                 val client = try { ss.accept() } catch (_: Throwable) { break }
                 if (track(localPort, ss, client)) thread { tcpBridge(client, host, onionPort, socksPort, localPort, ss) }
             }
-        }
+        }.also { acceptThreads[ss] = it; it.start() }
         Log.i(TAG, "tcp forwarder 127.0.0.1:$localPort -> :$onionPort (dynamic onion)")
     }
 
@@ -277,6 +284,9 @@ object TorNet {
                 // Connected-socket cleanup runs off Android's main thread; a StrictMode
                 // exception must never skip stopping the HTTP listener for the next call.
                 runCatching { item.listener?.close() }
+                // close() can return before a blocked accept() has released its OS
+                // descriptor. Wait for that reader before allowing immediate rebind.
+                item.listenerStopped.await(2, java.util.concurrent.TimeUnit.SECONDS)
                 thread(name = "call-proxy-cleanup", isDaemon = true) {
                     runCatching { item.server.stop() }
                     item.calls.forEach { runCatching { it.cancel() } }
@@ -284,7 +294,10 @@ object TorNet {
                     runCatching { item.client.connectionPool.evictAll() }
                 }
             }
-            is ServerSocket -> runCatching { item.close() }
+            is ServerSocket -> {
+                runCatching { item.close() }
+                acceptThreads.remove(item)?.join(2_000)
+            }
         }
     }
 

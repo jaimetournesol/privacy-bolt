@@ -61,16 +61,24 @@ class PpSyncService : Service() {
     override fun onCreate() {
         super.onCreate()
         ensureChannels(this)
+        scope.launch {
+            ConnectionLifecycle.withConnection { kotlinx.coroutines.awaitCancellation() }
+        }
         BackgroundSyncWorker.schedule(this)
         scope.launch {
             delay(5 * 60 * 60_000L)
             applicationContext.getSharedPreferences("pp_app", Context.MODE_PRIVATE).edit().putBoolean("background_limited", true).apply()
-            MatrixRepo.pauseSync()
             stopSelf()
         }
         // [C4] Reflect the real state right away — after a process-kill restart we are NOT
         // connected yet, so don't flash a misleading "Connected" before onStartCommand.
-        startForegroundCompat(if (MatrixRepo.isLoggedIn) "Connected over Tor" else "Reconnecting over Tor…")
+        startForegroundCompat("Reconnecting over Tor…")
+        scope.launch {
+            kotlinx.coroutines.flow.combine(TorManager.state, MatrixRepo.status) { tor, sync ->
+                if (tor is TorManager.State.Ready && sync == "Connected") "Connected over Tor"
+                else "Reconnecting over Tor…"
+            }.collect { updateStatus(it) }
+        }
         scope.launch { MatrixRepo.notifications.collect { post(it) } }
         // Continuous Backup Sync (feature G): while we're alive, watch the camera roll so a new
         // photo backs up promptly, and do a catch-up pass on start. WorkManager's KEEP policy
@@ -87,17 +95,18 @@ class PpSyncService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // [C4] The service is START_STICKY, so the OS restarts it after a low-memory kill
-        // — but the process was torn down, so MatrixRepo.client is null and nothing is
-        // delivered, while this notification used to read a misleading "Connected". So:
-        // if we're NOT logged in but a saved session exists, re-run the same restore the
-        // app's cold start does (wait for Tor Ready -> tryRestore -> startSync), showing
-        // "Reconnecting…" until sync is actually Connected. A live session is left alone.
+        if (ConnectionLifecycle.isPaused() || !MatrixRepo.hasSavedSession(this)) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        // A foreground launch can race the UI's cold restore. Recover if necessary;
+        // background process recovery is owned by the bounded WorkManager job.
         if (!MatrixRepo.isLoggedIn && MatrixRepo.hasSavedSession(this)) {
             startForegroundCompat("Reconnecting over Tor…")
             reviveSession()
         } else {
-            startForegroundCompat(if (MatrixRepo.isLoggedIn) "Connected over Tor" else "Reconnecting over Tor…")
+            startForegroundCompat(if (TorManager.state.value is TorManager.State.Ready && MatrixRepo.status.value == "Connected")
+                "Connected over Tor" else "Reconnecting over Tor…")
         }
         return START_NOT_STICKY
     }
@@ -255,9 +264,21 @@ class PpSyncService : Service() {
         const val EXTRA_ANSWER = "pp_answer_call"
 
         fun start(ctx: Context) {
-            ctx.getSharedPreferences("pp_app", Context.MODE_PRIVATE).edit().putBoolean("background_limited", false).apply()
-            val i = Intent(ctx, PpSyncService::class.java)
-            if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
+            val app = ctx.applicationContext
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                val prefs = app.getSharedPreferences("pp_app", Context.MODE_PRIVATE)
+                if (prefs.getBoolean("paused", false) || !MatrixRepo.hasSavedSession(app)) return@post
+                if (!androidx.lifecycle.ProcessLifecycleOwner.get().lifecycle.currentState
+                        .isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) {
+                    BackgroundSyncWorker.schedule(app)
+                    return@post
+                }
+                val i = Intent(app, PpSyncService::class.java)
+                runCatching {
+                    if (Build.VERSION.SDK_INT >= 26) app.startForegroundService(i) else app.startService(i)
+                    prefs.edit().putBoolean("background_limited", false).apply()
+                }.onFailure { BackgroundSyncWorker.schedule(app) }
+            }
         }
 
         /** Stop the foreground sync service (and drop its persistent "Connected over Tor"

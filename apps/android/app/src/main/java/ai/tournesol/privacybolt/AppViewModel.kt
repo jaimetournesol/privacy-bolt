@@ -342,12 +342,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Retry Tor from anywhere it's surfaced (the status badge, a login error). Kicks
      *  the embedded Tor back into bootstrapping; observers (the badge) update live. */
     fun retryTor() {
-        viewModelScope.launch(Dispatchers.IO) { runCatching { TorManager.retry(getApplication()) } }
+        viewModelScope.launch {
+            if (isPaused) return@launch
+            withContext(Dispatchers.IO) { TorManager.retry(getApplication()) }
+            ConnectionLifecycle.reconnectForeground()
+        }
     }
 
     fun login(onion: String, user: String, pass: String) {
         error.value = null
         busy.value = true
+        ConnectionLifecycle.reconnectForeground()
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 // Wait until Tor is ready before talking to the box.
@@ -1439,15 +1444,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Pause / "go dark": tear down sync + Tor and hide the chat list, WITHOUT signing
      *  out (session + keys stay). Peers' messages queue on Lodge (your computer) and
      *  arrive on Resume. Persisted so it holds across app restarts. */
+    private var pauseJob: kotlinx.coroutines.Job? = null
+    private var resumeJob: kotlinx.coroutines.Job? = null
+
     fun pause() {
+        resumeJob?.cancel()
         isPaused = true; paused.value = true
         val app = getApplication<Application>()
         screen.value = Screen.Paused
+        ConnectionLifecycle.cancelForeground()
         BackgroundSyncWorker.cancel(app)
         ai.tournesol.privacylodge.backup.BackupSyncWorker.cancelAll(app)
         ai.tournesol.privacybolt.net.TorNet.stopAll()
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { MatrixRepo.pauseSync() }   // stop the sync stream, keep the session
+        pauseJob = viewModelScope.launch(Dispatchers.IO) {
+            ConnectionLifecycle.drain()
+            runCatching { kotlinx.coroutines.withTimeoutOrNull(5_000) { MatrixRepo.pauseSync() } }
             runCatching { PpSyncService.stop(app) }  // drop the foreground service + its notification
             runCatching { TorManager.stop() }        // go offline — no circuits, nothing in or out
         }
@@ -1456,22 +1467,31 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Resume from [pause]: bring Tor back up, restore/resume the session, restart the
      *  background service, and return to the chats. Mirrors the cold-start restore. */
     fun resume() {
-        isPaused = false; paused.value = false
+        if (resumeJob?.isActive == true) return
         val app = getApplication<Application>()
-        restorePhase.value = RestorePhase.Working
-        screen.value = Screen.Splash
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { TorManager.start(app) }        // blocks until tor exits; fire-and-forget below
-        }
-        viewModelScope.launch(Dispatchers.IO) {
-            // Wait (bounded) for Tor to be Ready, then restore the session + resume sync.
-            var waited = 0
-            while (TorManager.state.value !is TorManager.State.Ready && waited < 90) { kotlinx.coroutines.delay(1000); waited++ }
-            if (!MatrixRepo.isLoggedIn) runCatching { MatrixRepo.tryRestore(app) }
-            runCatching { MatrixRepo.startSync() }
-            runCatching { PpSyncService.start(app) }
-            screen.value = if (MatrixRepo.isLoggedIn) Screen.Rooms else Screen.Login
-            consumePendingContact()
+        resumeJob = viewModelScope.launch {
+            pauseJob?.join()
+            isPaused = false; paused.value = false
+            restorePhase.value = RestorePhase.Working
+            screen.value = Screen.Splash
+            ConnectionLifecycle.reconnectForeground()
+            try {
+                val ready = withContext(Dispatchers.IO) {
+                    TorManager.start(app)
+                    ConnectionLifecycle.awaitReady(90_000)
+                }
+                if (!ready) { restorePhase.value = RestorePhase.Slow; return@launch }
+                val account = withContext(Dispatchers.IO) { MatrixRepo.restoreAccount(app) }
+                if (account == null) { screen.value = Screen.Login; return@launch }
+                withContext(Dispatchers.IO) { MatrixRepo.startSync(account) }
+                MatrixRepo.withAccount(account) {
+                    PpSyncService.start(app)
+                    screen.value = Screen.Rooms
+                    consumePendingContact()
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) { restorePhase.value = RestorePhase.Slow }
         }
     }
 
