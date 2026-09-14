@@ -221,10 +221,13 @@ object MatrixRepo {
     private val sessionFence = SessionFence()
     private val authenticationMutex = Mutex()
     private val logoutMutex = Mutex()
-    private var signingOut = false
+    @Volatile private var signingOut = false
+    internal val isSigningOut: Boolean get() = signingOut
     private var activeAuthentication: kotlinx.coroutines.Job? = null
     private var clientOwner: SessionFence.Ticket? = null
     private var syncService: SyncService? = null
+    private val syncMutex = Mutex()
+    @Volatile private var syncWanted = false
     private var roomListService: RoomListService? = null
     private var timeline: Timeline? = null
     // These subscription handles MUST be held for the lifetime of the sync /
@@ -711,16 +714,19 @@ object MatrixRepo {
         clientOwner ?: throw java.util.concurrent.CancellationException("No active account")
     }
 
-    /** Go offline WITHOUT signing out: stop the sync stream + its state watcher and
-     *  cancel the live timeline, but KEEP the client + persisted session so [startSync]
-     *  can resume. Backs the Pause ("go dark") control together with TorManager.stop()
+    /** Go offline WITHOUT signing out: stop sync, retaining the account's room and
+     *  timeline subscriptions so [startSync] can resume an already-open chat. Backs the Pause ("go dark") control together with TorManager.stop()
      *  and PpSyncService.stop(). Session, keys and consent are all left intact. */
     suspend fun pauseSync() {
-        invalidateChatTimeline()
-        runCatching { syncStateHandle?.cancel() }; syncStateHandle = null; syncRestartDelayMs = 0L
-        runCatching { timelineHandle?.cancel() }; timelineHandle = null
-        runCatching { syncService?.stop() }
-        status.value = ""
+        Log.i(TAG, "Pausing account sync")
+        syncWanted = false
+        syncMutex.withLock {
+            syncRestartDelayMs = 0L
+            runCatching { syncService?.stop() }
+            // Keep this account's timelines/subscriptions. They resume with the same
+            // service; deleting them here stranded an already-open chat on return.
+            status.value = ""
+        }
     }
 
     /** [UTD-recovery] A message we couldn't decrypt almost always means the megolm room
@@ -739,6 +745,9 @@ object MatrixRepo {
      *  Fire-and-forget; safe to call from rebuildRooms/toChatMsg. */
     private fun maybeRecoverFromUtd(sessionId: String?) {
         val sid = sessionId ?: return
+        if (!syncWanted || signingOut) return
+        val c = client ?: return
+        val owner = runCatching { ownerOf(c) }.getOrNull() ?: return
         val tried = utdAttempts[sid] ?: 0
         if (tried >= MAX_UTD_ATTEMPTS) return            // gave it enough tries — stop looping
         val now = System.currentTimeMillis()
@@ -748,29 +757,35 @@ object MatrixRepo {
         }
         if (!go) return
         scope.launch {
-            Log.i(TAG, "UTD recovery attempt ${tried + 1}/$MAX_UTD_ATTEMPTS: restarting sync to pull room keys (session $sid)")
-            runCatching { syncService?.stop() }
-            runCatching { startSync() }
+            syncMutex.withLock {
+                if (!syncWanted || client !== c || runCatching { withAccount(owner) {} }.isFailure) return@withLock
+                Log.i(TAG, "Room-key recovery attempt ${tried + 1}/$MAX_UTD_ATTEMPTS")
+                runCatching { syncService?.stop() }
+                if (syncWanted) runCatching { syncService?.start() }
+            }
         }
     }
 
-    internal suspend fun startSync(expectedOwner: SessionFence.Ticket? = null) {
+    internal suspend fun startSync(expectedOwner: SessionFence.Ticket? = null) = syncMutex.withLock {
+        Log.i(TAG, "Starting account sync (reuse=${syncService != null})")
         val c = client ?: error("not logged in")
         val owner = expectedOwner ?: ownerOf(c)
         sessionFence.use(owner) { }
+        if (signingOut || appContext?.getSharedPreferences("pp_app", Context.MODE_PRIVATE)?.getBoolean("paused", false) == true)
+            return@withLock
         runCatching { loadConsent() }   // restore who we've already scanned
         sessionFence.use(owner) { }
-        val ss = c.syncService().finish()
-        try {
-            sessionFence.use(owner) { syncService = ss }
+        // The SDK's sync service owns its room-list/event-cache tasks. Construct it
+        // once per account: overlapping UI/worker starts must never replace it.
+        val ss = syncService ?: c.syncService().finish().also { created ->
+            sessionFence.use(owner) { syncService = created }
+        }
+        syncWanted = true
+        if (status.value != "Connected") status.value = "Reconnecting over Tor…"
+        if (roomListResult != null && syncStateHandle != null) {
             ss.start()
             sessionFence.use(owner) { }
-        } catch (t: Throwable) {
-            withContext(NonCancellable) {
-                runCatching { kotlinx.coroutines.withTimeoutOrNull(5_000) { ss.stop() } }
-                runCatching { ss.close() }
-            }
-            throw t
+            return@withLock
         }
         // Watch the sync stream and self-heal. RUNNING -> reset backoff + reconcile
         // any room/pairing/call state that drifted while we were down. ERROR /
@@ -781,6 +796,7 @@ object MatrixRepo {
         runCatching { syncStateHandle?.cancel() }
         syncStateHandle = ss.state(object : org.matrix.rustcomponents.sdk.SyncServiceStateObserver {
             override fun onUpdate(state: org.matrix.rustcomponents.sdk.SyncServiceState) {
+                if (!syncWanted || client !== c || runCatching { withAccount(owner) {} }.isFailure) return
                 Log.i(TAG, "syncService state=$state")
                 when (state) {
                     org.matrix.rustcomponents.sdk.SyncServiceState.RUNNING -> {
@@ -791,6 +807,7 @@ object MatrixRepo {
                             // Re-read consent from account-data first so a removal (here
                             // or on another device) propagates and the consent-gated hide
                             // in rebuildRooms takes effect this cycle.
+                            if (!syncWanted || client !== c) return@launch
                             runCatching { loadConsent() }
                             runCatching { autoAcceptMutual() }
                             runCatching { reInviteStalePeers() }
@@ -822,14 +839,29 @@ object MatrixRepo {
                         status.value = "Reconnecting over Tor…"
                         scope.launch {
                             kotlinx.coroutines.delay(delay)
-                            Log.i(TAG, "syncService restart after ${delay}ms (was $state)")
-                            runCatching { ss.start() }
+                            syncMutex.withLock {
+                                if (syncWanted && client === c && syncService === ss) {
+                                    Log.i(TAG, "syncService restart after ${delay}ms (was $state)")
+                                    runCatching { ss.start() }
+                                }
+                            }
                         }
                     }
                     else -> {}   // IDLE / OFFLINE — SDK-managed
                 }
             }
         })
+        // Subscribe before start: the SDK stream reports changes, so subscribing
+        // after start can miss RUNNING and leave the visible status reconnecting.
+        try {
+            ss.start()
+            sessionFence.use(owner) { }
+        } catch (t: Throwable) {
+            withContext(NonCancellable) {
+                runCatching { kotlinx.coroutines.withTimeoutOrNull(5_000) { ss.stop() } }
+            }
+            throw t
+        }
         val rls = ss.roomListService()
         roomListService = rls
         val rl = rls.allRooms()
@@ -847,7 +879,6 @@ object MatrixRepo {
         roomListResult = result            // HOLD: owns the entries-stream TaskHandle
         // populate: no extra filtering, just show every room we're in
         result.controller().setFilter(RoomListEntriesDynamicFilterKind.All(emptyList()))
-        status.value = "Connected"
         // arm notifications: only events from ~now on are "new" (avoids backfill).
         notifyFromMs = System.currentTimeMillis()
         scope.launch { kotlinx.coroutines.delay(3000); notifyArmed = true }
@@ -867,6 +898,7 @@ object MatrixRepo {
             scope.launch {
                 while (true) {
                     kotlinx.coroutines.delay(if (appForeground) FOREGROUND_POLL_MS else BACKGROUND_POLL_MS)
+                    if (!syncWanted || signingOut) continue
                     runCatching { checkNotifs() }
                     // Self-correct room + pairing state even when nothing reordered
                     // the room list — a peer joining an existing room (-> "paired") or
@@ -894,6 +926,7 @@ object MatrixRepo {
     fun onForeground(foreground: Boolean) {
         appForeground = foreground
         if (foreground) scope.launch {
+            if (!syncWanted || signingOut) return@launch
             // Refresh consent from account-data on resume so a removal made on another
             // device (or box-side) is reflected the moment the app is opened — then
             // rebuild so the consent-gated hide/show takes effect. loadConsent keeps the
@@ -2284,9 +2317,12 @@ object MatrixRepo {
                 var cleaned = false
                 try {
                     sessionFence.use(after) { clearStoredSession(ctx) }
+                    syncWanted = false
+                    // A worker may be waiting for authenticationMutex. Cancel and join
+                    // it before taking that mutex, otherwise sign-out can deadlock.
+                    ai.tournesol.privacybolt.AccountPrivacy.clearLocalAccess(ctx)
                     authenticationMutex.withLock {
                         invalidateChatTimeline()
-                        ai.tournesol.privacybolt.AccountPrivacy.clearLocalAccess(ctx)
                         closeBackupLibrary()
                         agents.value = emptyMap()
                         agentRooms.value = emptyList()

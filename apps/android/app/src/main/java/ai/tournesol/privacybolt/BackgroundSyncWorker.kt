@@ -17,18 +17,14 @@ class BackgroundSyncWorker(context: Context, parameters: WorkerParameters) : Cor
         if (prefs.getBoolean("paused", false) || !MatrixRepo.hasSavedSession(applicationContext)) return Result.success()
         if (ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return Result.success()
         val completed = withTimeoutOrNull(120_000) {
-            TorManager.start(applicationContext)
-            while (TorManager.state.value !is TorManager.State.Ready) delay(500)
-            if (!MatrixRepo.isLoggedIn) MatrixRepo.tryRestore(applicationContext)
-            if (!MatrixRepo.isLoggedIn) return@withTimeoutOrNull false
-            MatrixRepo.startSync()
-            delay(20_000)
-            true
+            ConnectionLifecycle.withConnection {
+                if (!ConnectionLifecycle.awaitReady()) return@withConnection false
+                val account = MatrixRepo.restoreAccount(applicationContext) ?: return@withConnection false
+                MatrixRepo.startSync(account)
+                delay(20_000)
+                true
+            }
         } ?: false
-        if (!ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
-            MatrixRepo.pauseSync()
-            TorManager.stop()
-        }
         return if (completed) Result.success() else Result.retry()
     }
 

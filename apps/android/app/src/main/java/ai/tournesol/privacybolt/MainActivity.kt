@@ -275,10 +275,10 @@ private fun TorBadge(modifier: Modifier = Modifier, onRetry: (() -> Unit)? = nul
         is TorManager.State.Ready -> "Tor: connected" to Success
         is TorManager.State.Bootstrapping -> "Tor: ${s.percent}% ${s.message}" to PaperDim
         is TorManager.State.Failed -> "Tor: failed · tap to retry" to Danger
-        else -> "Tor: starting…" to PaperDim
+        else -> "Tor: offline · tap to reconnect" to PaperDim
     }
     // Only the failed state is actionable (a healthy/booting Tor needs no nudge).
-    val actionable = onRetry != null && st is TorManager.State.Failed
+    val actionable = onRetry != null && (st is TorManager.State.Failed || st is TorManager.State.Idle)
     var showSheet by remember { mutableStateOf(false) }
 
     Row(

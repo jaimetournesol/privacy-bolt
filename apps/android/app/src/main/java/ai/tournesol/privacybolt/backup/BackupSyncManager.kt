@@ -53,19 +53,10 @@ object BackupSyncManager {
      */
     suspend fun ensureSession(ctx: Context): Boolean {
         if (ctx.getSharedPreferences("pp_app", Context.MODE_PRIVATE).getBoolean("paused", false)) return false
-        if (MatrixRepo.isLoggedIn) return true
         if (!MatrixRepo.hasSavedSession(ctx)) return false
-        runCatching { TorManager.start(ctx) }
-        var waited = 0
-        while (TorManager.state.value !is TorManager.State.Ready && waited < 120) {
-            if (MatrixRepo.isLoggedIn) return true
-            delay(1000); waited++
-        }
-        if (TorManager.state.value !is TorManager.State.Ready) return MatrixRepo.isLoggedIn
-        if (!MatrixRepo.isLoggedIn) {
-            if (!runCatching { MatrixRepo.tryRestore(ctx) }.getOrDefault(false)) return false
-            runCatching { MatrixRepo.startSync() }
-        }
+        if (!ai.tournesol.privacybolt.ConnectionLifecycle.awaitReady()) return false
+        val account = MatrixRepo.restoreAccount(ctx) ?: return false
+        MatrixRepo.startSync(account)
         return MatrixRepo.isLoggedIn
     }
 

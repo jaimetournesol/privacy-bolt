@@ -14,11 +14,13 @@ object AccountPrivacy {
 
     suspend fun clearLocalAccess(context: Context) {
         gate.value = Gate.Locked
+        withContext(Dispatchers.Main) { ConnectionLifecycle.cancelForeground() }
         // Independent privacy stores must still be cleared if a service/provider is
         // unavailable. Never log exception messages here: they can contain identities.
         runCatching { PpSyncService.stop(context) }
         runCatching { BackgroundSyncWorker.cancel(context) }
         runCatching { BackupSyncWorker.cancelAll(context) }
+        ConnectionLifecycle.drain()
         runCatching { BackupSyncStore.clearAccount(context) }
         runCatching { TorNet.stopAll() }
         val permissions = runCatching { context.contentResolver.persistedUriPermissions }.getOrDefault(emptyList())
@@ -30,8 +32,14 @@ object AccountPrivacy {
         }
         runCatching { context.getSharedPreferences("pp_agents", Context.MODE_PRIVATE).edit().clear().commit() }
         withContext(Dispatchers.Main) {
-            runCatching { android.webkit.CookieManager.getInstance().removeAllCookies(null) }
-            runCatching { android.webkit.CookieManager.getInstance().flush() }
+            AccountWebViews.closeAll()
+            val cookies = android.webkit.CookieManager.getInstance()
+            kotlinx.coroutines.suspendCancellableCoroutine<Unit> { continuation ->
+                cookies.removeAllCookies {
+                    if (continuation.isActive) continuation.resumeWith(Result.success(Unit))
+                }
+            }
+            cookies.flush()
             runCatching { android.webkit.WebStorage.getInstance().deleteAllData() }
         }
     }

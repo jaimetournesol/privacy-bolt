@@ -150,6 +150,7 @@ class AgentSettingsActivity : ComponentActivity() {
 
         val root = FrameLayout(this)
         web = WebView(this)
+        AccountWebViews.register(web)
         root.addView(web, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         root.addView(buildOverlay())
@@ -253,8 +254,18 @@ class AgentSettingsActivity : ComponentActivity() {
         overlayProgress?.visibility = View.VISIBLE
         retryButton?.visibility = View.GONE
         web.setBackgroundColor(0xFFF7F2E9.toInt())
-        web.loadUrl(entryUrl)
         loadWatch = lifecycleScope.launch {
+            val connected = ConnectionLifecycle.withConnection {
+                ConnectionLifecycle.awaitReady(90_000)
+            } == true
+            if (generation != loadGeneration || isFinishing) return@launch
+            if (!connected) {
+                status?.text = "Your phone couldn't connect to Tor. Check its internet connection, then try again."
+                overlayProgress?.visibility = View.GONE
+                retryButton?.visibility = View.VISIBLE
+                return@launch
+            }
+            web.loadUrl(entryUrl)
             val deadline = android.os.SystemClock.elapsedRealtime() + 90_000
             while (isActive && !isFinishing && !pageReady && android.os.SystemClock.elapsedRealtime() < deadline) {
                 delay(500)
@@ -315,13 +326,15 @@ class AgentSettingsActivity : ComponentActivity() {
     private fun retryOrGiveUp() {
         loadAttempts++
         if (loadAttempts >= maxLoadAttempts) {
-            status?.text = "Couldn't reach Conductor. Lodge may still be starting."
+            status?.text = if (TorManager.state.value is TorManager.State.Ready)
+                "Tor is connected, but Conductor couldn't be reached. Check that Lodge is running, then try again."
+            else "Your phone lost its Tor connection. Check its internet connection, then try again."
             overlayProgress?.visibility = View.GONE
             retryButton?.visibility = View.VISIBLE
             overlay?.visibility = View.VISIBLE
             return
         }
-        status?.text = "Conductor is still starting. Retrying the connection…"
+        status?.text = "Retrying the Conductor connection…"
         overlay?.visibility = View.VISIBLE
         overlayProgress?.visibility = View.VISIBLE
         val generation = loadGeneration
@@ -393,7 +406,7 @@ class AgentSettingsActivity : ComponentActivity() {
         pendingFileCallback?.onReceiveValue(null)
         pendingFileCallback = null
         ownedPorts.forEach { TorNet.stopPort(it) }
-        runCatching { web.stopLoading(); web.loadUrl("about:blank"); web.clearHistory(); web.destroy() }
+        if (::web.isInitialized) AccountWebViews.close(web)
         super.onDestroy()
     }
 }

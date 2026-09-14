@@ -50,12 +50,14 @@ class BackupSyncWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker
             || !BackupSyncStore.hasEnabledSource(applicationContext)) return Result.success()
         PpSyncService.ensureChannels(applicationContext)
         runCatching { setForeground(getForegroundInfo()) }   // long uploads survive backgrounding
-        if (!BackupSyncManager.ensureSession(applicationContext)) return Result.retry()
-        return when (val outcome = BackupSyncManager.runPass(applicationContext)) {
-            is BackupSyncManager.Result.Done -> if (outcome.failed == 0 && outcome.skipped == 0) Result.success() else Result.retry()
-            BackupSyncManager.Result.AlreadyRunning -> Result.success()
-            BackupSyncManager.Result.NotReady -> Result.retry()
-        }
+        return ai.tournesol.privacybolt.ConnectionLifecycle.withConnection {
+            if (!BackupSyncManager.ensureSession(applicationContext)) return@withConnection Result.retry()
+            when (val outcome = BackupSyncManager.runPass(applicationContext)) {
+                is BackupSyncManager.Result.Done -> if (outcome.failed == 0 && outcome.skipped == 0) Result.success() else Result.retry()
+                BackupSyncManager.Result.AlreadyRunning -> Result.success()
+                BackupSyncManager.Result.NotReady -> Result.retry()
+            }
+        } ?: Result.success()
     }
 
     companion object {
