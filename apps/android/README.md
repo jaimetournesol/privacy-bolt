@@ -92,3 +92,17 @@ findings are in [`../../docs/element-call-over-onion-requirements.md`](../../doc
 - E2EE (per-participant-key) calls — the first call connect uses the room's
   unencrypted-call mode; encrypted calls are a follow-on toggle.
 - Key-verification UI, attachments, richer presence; iOS client (per the plan).
+
+### Imported agent Surfaces
+
+With an updated Privacy Lodge, the Agents WebUI can import a single agent shared
+by someone else's Conductor. Exchange its one-use invitation in a private chat,
+then paste it into **Sharing → Import** on your own Conductor. Each recipient has
+separate permissions and revocation. The shared agent remains on its owner's
+machine; this does not enroll that machine or grant access to its fleet.
+
+Bolt forwards the imported Surface's isolated origins through the paired Lodge's
+existing owner-authenticated agent onion: local ports 18806–18821 map to onion
+ports 8807–8822. Existing owned-machine Surface ports are unchanged. Shared
+Surfaces are read-only in this release. This requires the matching Lodge runtime
+and port map; invitation exchange itself is manual.
