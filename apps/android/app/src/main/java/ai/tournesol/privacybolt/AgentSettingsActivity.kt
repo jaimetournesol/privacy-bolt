@@ -146,6 +146,13 @@ class AgentSettingsActivity : ComponentActivity() {
                 ownedPorts.add(local)
                 TorNet.startTcpForwarder(local, { webui.onion }, remote, TorManager.SOCKS_PORT)
             }
+            // One isolated origin per shared agent, forwarded through the owner's
+            // existing authenticated Agentnode onion, never the Matrix service.
+            for (slot in 1..16) {
+                val local = AGENT_LOCAL + 18 + slot
+                ownedPorts.add(local)
+                TorNet.startTcpForwarder(local, { webui.onion }, 8806 + slot, TorManager.SOCKS_PORT)
+            }
         }
 
         val root = FrameLayout(this)
