@@ -14,8 +14,12 @@ def adb(*args):
     return subprocess.check_output(['adb','-s',serial,*args],text=True)
 
 def nodes():
-    adb('shell','uiautomator','dump','/sdcard/ci-ui.xml')
-    return list(ET.fromstring(adb('shell','cat','/sdcard/ci-ui.xml')).iter('node'))
+    try:
+        adb('shell','rm','-f','/sdcard/ci-ui.xml')
+        adb('shell','uiautomator','dump','/sdcard/ci-ui.xml')
+        return list(ET.fromstring(adb('shell','cat','/sdcard/ci-ui.xml')).iter('node'))
+    except (subprocess.CalledProcessError, ET.ParseError):
+        return []  # Android may not expose an accessibility root during launch.
 
 def find(text):
     deadline=time.monotonic()+45
