@@ -21,11 +21,15 @@ def nodes():
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ET.ParseError):
         return []  # Android may not expose an accessibility root during launch.
 
-def find(text):
+def find(text, scroll=False):
     deadline=time.monotonic()+45
     while time.monotonic()<deadline:
         for n in nodes():
             if n.get('text') == text or n.get('content-desc') == text:return n
+        if scroll:
+            import re
+            width,height=map(int,re.findall(r'(\d+)x(\d+)',adb('shell','wm','size'))[-1])
+            adb('shell','input','swipe',str(width//2),str(height*3//4),str(width//2),str(height//3),'300')
         time.sleep(1)
     raise AssertionError('UI control not found: '+text)
 
@@ -39,9 +43,9 @@ try:
     adb('shell','am','start','-n',package+'/ai.tournesol.privacybolt.MainActivity')
     find('Scan setup code')
     tap(find('or sign in manually'))
-    find('Lodge (.onion)'); find('Password')
+    find('Lodge (.onion)'); find('Password', scroll=True)
     # Empty credentials must not submit; password starts concealed.
-    assert find('Connect over Tor').get('enabled') == 'false'
+    assert find('Connect over Tor', scroll=True).get('enabled') == 'false'
     find('Show password')
     # Android process recreation must return to a usable, unauthenticated screen.
     adb('shell','am','force-stop',package)
