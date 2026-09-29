@@ -17,7 +17,15 @@ def nodes():
     try:
         adb('shell','rm','-f','/sdcard/ci-ui.xml')
         adb('shell','uiautomator','dump','/sdcard/ci-ui.xml')
-        return list(ET.fromstring(adb('shell','cat','/sdcard/ci-ui.xml')).iter('node'))
+        root=ET.fromstring(adb('shell','cat','/sdcard/ci-ui.xml'))
+        result=[]
+        def visit(node, enabled=True):
+            enabled=enabled and node.get('enabled') != 'false'
+            node.set('ci-enabled',str(enabled).lower())
+            if node.tag=='node':result.append(node)
+            for child in node:visit(child,enabled)
+        visit(root)
+        return result
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ET.ParseError):
         return []  # Android may not expose an accessibility root during launch.
 
@@ -45,7 +53,7 @@ try:
     tap(find('or sign in manually'))
     find('Lodge (.onion)'); find('Password', scroll=True)
     # Empty credentials must not submit; password starts concealed.
-    assert find('Connect over Tor', scroll=True).get('enabled') == 'false'
+    assert find('Connect over Tor', scroll=True).get('ci-enabled') == 'false'
     find('Show password')
     # Android process recreation must return to a usable, unauthenticated screen.
     adb('shell','am','force-stop',package)
