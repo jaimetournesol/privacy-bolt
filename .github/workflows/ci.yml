@@ -92,3 +92,10 @@ jobs:
           script: |
             adb install apk/app-debug.apk
             ANDROID_SERIAL=emulator-5554 python3 scripts/ci/android-ui.py
+      - name: Upload synthetic UI evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: emulator-ui
+          path: ci-ui.png
+          retention-days: 7

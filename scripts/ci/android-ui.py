@@ -11,14 +11,14 @@ if os.environ.get('GITHUB_ACTIONS') != 'true' or not serial.startswith('emulator
 package = 'ai.tournesol.privacybolt.debug'
 
 def adb(*args):
-    return subprocess.check_output(['adb','-s',serial,*args],text=True)
+    return subprocess.check_output(['adb','-s',serial,*args],text=True,timeout=20)
 
 def nodes():
     try:
         adb('shell','rm','-f','/sdcard/ci-ui.xml')
         adb('shell','uiautomator','dump','/sdcard/ci-ui.xml')
         return list(ET.fromstring(adb('shell','cat','/sdcard/ci-ui.xml')).iter('node'))
-    except (subprocess.CalledProcessError, ET.ParseError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ET.ParseError):
         return []  # Android may not expose an accessibility root during launch.
 
 def find(text):
@@ -34,17 +34,22 @@ def tap(n):
     a,b,c,d=map(int,re.findall(r'\d+',n.get('bounds')))
     adb('shell','input','tap',str((a+c)//2),str((b+d)//2))
 
-adb('shell','pm','grant',package,'android.permission.POST_NOTIFICATIONS')
-adb('shell','am','start','-n',package+'/ai.tournesol.privacybolt.MainActivity')
-find('Scan setup code')
-tap(find('or sign in manually'))
-find('Lodge (.onion)'); find('Password')
-# Empty credentials must not submit; password starts concealed.
-assert find('Connect over Tor').get('enabled') == 'false'
-find('Show password')
-# Android process recreation must return to a usable, unauthenticated screen.
-adb('shell','am','force-stop',package)
-adb('shell','am','start','-n',package+'/ai.tournesol.privacybolt.MainActivity')
-find('Scan setup code')
-assert adb('shell','pidof',package).strip()
-print('PASS: onboarding, manual login, empty-credential guard, concealed password and process recreation')
+try:
+    adb('shell','pm','grant',package,'android.permission.POST_NOTIFICATIONS')
+    adb('shell','am','start','-n',package+'/ai.tournesol.privacybolt.MainActivity')
+    find('Scan setup code')
+    tap(find('or sign in manually'))
+    find('Lodge (.onion)'); find('Password')
+    # Empty credentials must not submit; password starts concealed.
+    assert find('Connect over Tor').get('enabled') == 'false'
+    find('Show password')
+    # Android process recreation must return to a usable, unauthenticated screen.
+    adb('shell','am','force-stop',package)
+    adb('shell','am','start','-n',package+'/ai.tournesol.privacybolt.MainActivity')
+    find('Scan setup code')
+    assert adb('shell','pidof',package).strip()
+    print('PASS: onboarding, manual login, empty-credential guard, concealed password and process recreation')
+finally:
+    from pathlib import Path
+    with Path('ci-ui.png').open('wb') as out:
+        subprocess.run(['adb','-s',serial,'exec-out','screencap','-p'],stdout=out,timeout=20)
